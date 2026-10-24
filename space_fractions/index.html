@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Space Fractions — Cosmic Fraction Explorer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="game-app">
+    <!-- Game Navigation Header / HUD -->
+    <header id="game-header">
+      <div class="hud-brand">
+        <span class="hud-logo">🚀</span>
+        <div>
+          <h1 class="hud-title">Space Fractions</h1>
+          <span class="hud-subtitle">Grade 6 Math Academy</span>
+        </div>
+      </div>
+      
+      <div id="hud-stats" class="hidden">
+        <div class="stat-pill">
+          <span class="stat-label">Sector</span>
+          <span id="hud-level" class="stat-value">Level 1</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-label">Score</span>
+          <span id="hud-score" class="stat-value">0</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-label">Shields</span>
+          <span id="hud-shields" class="stat-value">🛡️ 🛡️ 🛡️</span>
+        </div>
+        <button id="btn-pause" class="btn-hud" title="Pause Game (Hotkey: P or Esc)">⏸️ Pause</button>
+      </div>
+    </header>
+
+    <!-- Main Game Viewport -->
+    <main id="viewport">
+      
+      <!-- SCREEN 1: START / BRIEFING SCREEN -->
+      <section id="screen-start" class="game-screen active">
+        <div class="briefing-card">
+          <div class="space-badge">MISSION BRIEFING</div>
+          <h2>Welcome, Cadet!</h2>
+          <p class="mission-text">
+            Deep-space anomalies have disrupted our spacecraft's navigational thrusters and fuel cells.
+            To navigate safely through the asteroid belt, you must recalibrate the power matrix using
+            <strong>fraction mathematics</strong>: simplifying ratios, identifying equivalent fractions,
+            and solving quantum fuel-mixing calculations.
+          </p>
+
+          <div class="curriculum-badges">
+            <span class="badge">Grade 6 Fractions</span>
+            <span class="badge">Equivalent Fractions</span>
+            <span class="badge">Simplification</span>
+            <span class="badge">Fraction Arithmetic</span>
+          </div>
+
+          <div class="level-select">
+            <label for="select-difficulty">Select Starting Mission Level:</label>
+            <select id="select-difficulty">
+              <option value="1">Level 1: Cadet — Fraction Identification & Equivalence</option>
+              <option value="2">Level 2: Pilot — Fraction Comparisons & Common Denominators</option>
+              <option value="3">Level 3: Commander — Addition, Subtraction & Mixed Challenges</option>
+            </select>
+          </div>
+
+          <div class="start-actions">
+            <button id="btn-start-game" class="btn-primary">Launch Mission [Enter]</button>
+          </div>
+
+          <div class="controls-hint">
+            <strong>Controls:</strong> Click options or press keys <strong>1-4</strong> (or <strong>A-D</strong>). Press <strong>P</strong> to pause.
+          </div>
+        </div>
+      </section>
+
+      <!-- SCREEN 2: ACTIVE QUESTION / PLAYING SCREEN -->
+      <section id="screen-play" class="game-screen hidden">
+        <div class="mission-status-bar">
+          <span id="question-counter">Question 1 of 10</span>
+          <span id="sector-topic">Topic: Fraction Simplification</span>
+          <span id="streak-counter">Streak: 0 🔥</span>
+        </div>
+
+        <div class="question-container">
+          <h3 id="question-prompt">Calibrating Thruster Matrix...</h3>
+
+          <!-- Visual Mathematical Representation (SVG Pie or Fraction Bar) -->
+          <div id="visual-representation" class="visual-container">
+            <!-- Dynamic SVG injected via fraction_engine.js -->
+          </div>
+
+          <!-- Multiple Choice Options Grid -->
+          <div id="options-grid" class="options-grid">
+            <button class="option-btn" data-index="0"><span class="key-hint">1</span><span class="option-text">Option A</span></button>
+            <button class="option-btn" data-index="1"><span class="key-hint">2</span><span class="option-text">Option B</span></button>
+            <button class="option-btn" data-index="2"><span class="key-hint">3</span><span class="option-text">Option C</span></button>
+            <button class="option-btn" data-index="3"><span class="key-hint">4</span><span class="option-text">Option D</span></button>
+          </div>
+        </div>
+
+        <!-- Feedback & Explanation Banner -->
+        <div id="feedback-banner" class="feedback-banner hidden">
+          <div id="feedback-title" class="feedback-title">Correct!</div>
+          <p id="feedback-explanation" class="feedback-explanation">Explanation goes here.</p>
+          <button id="btn-next-question" class="btn-primary">Next Challenge [Space / Enter]</button>
+        </div>
+      </section>
+
+      <!-- SCREEN 3: PAUSE OVERLAY -->
+      <section id="screen-pause" class="game-screen hidden overlay-screen">
+        <div class="overlay-card">
+          <h2>Mission Paused</h2>
+          <p>The thrusters are temporarily held in stasis.</p>
+          <div class="overlay-actions">
+            <button id="btn-resume" class="btn-primary">Resume Mission [P / Esc]</button>
+            <button id="btn-restart-from-pause" class="btn-secondary">Abort & Restart</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCREEN 4: GAME OVER / MISSION COMPLETE SCREEN -->
+      <section id="screen-gameover" class="game-screen hidden">
+        <div class="gameover-card">
+          <div id="gameover-badge" class="space-badge victory">MISSION COMPLETE</div>
+          <h2 id="gameover-heading">Mission Debriefing</h2>
+          <p id="gameover-message">You successfully calibrated the spacecraft navigation matrix!</p>
+
+          <div class="final-stats-grid">
+            <div class="stat-card">
+              <span class="stat-card-title">Final Score</span>
+              <span id="final-score" class="stat-card-val">0</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-card-title">Accuracy</span>
+              <span id="final-accuracy" class="stat-card-val">100%</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-card-title">Questions Solved</span>
+              <span id="final-solved" class="stat-card-val">10 / 10</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-card-title">Rank Earned</span>
+              <span id="final-rank" class="stat-card-val">Chief Navigator</span>
+            </div>
+          </div>
+
+          <div class="gameover-actions">
+            <button id="btn-play-again" class="btn-primary">New Mission [Enter]</button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Footer with Learning Objectives & Offline Notice -->
+    <footer id="game-footer">
+      <span>Space Fractions v1.0 | Offline Standalone Delivery | Grade 6 Mathematics Standard (CCSS 6.NS)</span>
+    </footer>
+  </div>
+
+  <!-- Pure, Dependency-Free Game Engine Scripts -->
+  <script src="fraction_engine.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

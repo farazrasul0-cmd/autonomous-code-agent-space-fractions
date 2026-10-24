@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spacefractions
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spacefractions
+  template:
+    metadata:
+      labels:
+        app: spacefractions
+    spec:
+      containers:
+      - name: spacefractions
+        image: spacefractions:latest
+        ports:
+        - containerPort: 80

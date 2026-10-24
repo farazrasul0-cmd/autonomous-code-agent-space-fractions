@@ -1,0 +1,26 @@
+# Security: Credentials and Secrets
+.env
+.env.txt
+*.key
+*.pem
+
+# Python & Packaging
+__pycache__/
+*.py[cod]
+*$py.class
+packaging_poc/*.spec
+build/
+.pytest_cache/
+venv/
+packaging_poc/venv/
+packaging_poc/build/
+packaging_poc/dist/
+
+# Local Scratch & Safety Backups
+space_fractions/fraction_math.py.bak
+live_run_fraction_math/
+
+# Evidence logs
+*interaction_result.txt
+generated_space_fractions/
+

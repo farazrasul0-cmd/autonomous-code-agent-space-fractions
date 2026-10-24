@@ -1,0 +1,20 @@
+openapi: 3.0.0
+info:
+  title: Space Fractions API
+  description: API for the Space Fractions game
+  version: 1.0.0
+paths:
+  /play:
+    get:
+      summary: Play the game
+      responses:
+        200:
+          description: Game started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  gameId:
+                    type: integer
+                    description: Game ID
