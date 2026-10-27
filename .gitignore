@@ -1,26 +1,40 @@
 # Security: Credentials and Secrets
 .env
-.env.txt
+.env.*
 *.key
 *.pem
 
-# Python & Packaging
+# Python & Virtual Environments
 __pycache__/
 *.py[cod]
 *$py.class
-packaging_poc/*.spec
+*.pyd
+venv/
+.venv/
+packaging_poc/
 build/
 .pytest_cache/
-venv/
-packaging_poc/venv/
-packaging_poc/build/
-packaging_poc/dist/
+dist/onedir/
+dist/code_agent/
 
-# Local Scratch & Safety Backups
-space_fractions/fraction_math.py.bak
-live_run_fraction_math/
+# Local Test & Run Artifacts
+scratch/
+test_tmp_*/
+*_run/
+live_submission_run*/
+.staging_*/
+*.bak
+*.tmp
+*.log
 
-# Evidence logs
+# Historical & Local Evidence
 *interaction_result.txt
 generated_space_fractions/
-
+canary_runner.py
+run_*.py
+fraction_math_single_turn_run/
+manual_acceptance_run/
+packaged_acceptance_*_run/
+space_fractions_modular_run/
+space_fractions_stage*_run/
+live_run_*/

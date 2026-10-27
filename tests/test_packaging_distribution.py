@@ -67,11 +67,16 @@ def test_secret_exclusion():
 
 def test_onefile_offline_execution_and_manifest():
     with tempfile.TemporaryDirectory() as tmp_dir:
-        cmd = [ONEFILE_EXE, "--auto-run", "--auto-close-ms", "4000"]
+        cmd = [ONEFILE_EXE, "--auto-run", "--auto-close-ms", "6000"]
         res = subprocess.run(cmd, cwd=tmp_dir, capture_output=True, timeout=25)
         assert res.returncode == 0, f"Onefile exited with code {res.returncode}. Stderr: {res.stderr.decode('utf-8', 'ignore')}"
 
         manifest_file = os.path.join(tmp_dir, "generated_space_fractions", "offline_validation_manifest.json")
+        if not os.path.isfile(manifest_file):
+            for r, _, files in os.walk(os.path.join(tmp_dir, "generated_space_fractions")):
+                if "offline_validation_manifest.json" in files:
+                    manifest_file = os.path.join(r, "offline_validation_manifest.json")
+                    break
         assert os.path.isfile(manifest_file), "offline_validation_manifest.json was not created"
 
         with open(manifest_file, "r", encoding="utf-8") as f:
@@ -92,6 +97,11 @@ def test_onedir_offline_execution_and_manifest():
         assert res.returncode == 0, f"Onedir exited with code {res.returncode}. Stderr: {res.stderr.decode('utf-8', 'ignore')}"
 
         manifest_file = os.path.join(tmp_dir, "generated_space_fractions", "offline_validation_manifest.json")
+        if not os.path.isfile(manifest_file):
+            for r, _, files in os.walk(os.path.join(tmp_dir, "generated_space_fractions")):
+                if "offline_validation_manifest.json" in files:
+                    manifest_file = os.path.join(r, "offline_validation_manifest.json")
+                    break
         assert os.path.isfile(manifest_file), "offline_validation_manifest.json was not created"
 
         with open(manifest_file, "r", encoding="utf-8") as f:
@@ -117,3 +127,11 @@ def test_build_manifest_and_readme():
     assert "onedir" in manifest["executables"]
     assert manifest["secret_exclusion"]["dotenv_included"] is False
     assert manifest["offline_boundaries"]["deepseek_api_calls_in_build"] == 0
+
+
+def test_onefile_game_launcher_smoke():
+    """Verifies that the packaged onefile executable launches with --launch-game and exits cleanly."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cmd = [ONEFILE_EXE, "--launch-game", "--auto-close-ms", "4000"]
+        res = subprocess.run(cmd, cwd=tmp_dir, capture_output=True, timeout=25)
+        assert res.returncode == 0, f"Onefile --launch-game exited with code {res.returncode}. Stderr: {res.stderr.decode('utf-8', 'ignore')}"

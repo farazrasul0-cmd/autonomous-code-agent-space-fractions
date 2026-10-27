@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from src.budget_controller import BudgetController, BudgetExceededError
+from src.budget_controller import BudgetController, BudgetExceededError, BudgetException
 from src.response_parser import ParsedResponse, ResponseClassification, ResponseParser
 
 logger = logging.getLogger("DeepSeekClient")
@@ -103,7 +103,9 @@ class DeepSeekClient:
         self.base_url: str = base_url.rstrip("/")
         self.model: str = model
         self.timeout: float = max(1.0, float(timeout))
-        self.max_output_tokens: int = min(max_output_tokens, 4096)
+        if not isinstance(max_output_tokens, int) or max_output_tokens <= 0 or max_output_tokens > 4096:
+            raise ValueError(f"max_output_tokens must be an integer between 1 and 4096, got {max_output_tokens}")
+        self.max_output_tokens: int = max_output_tokens
         self.budget_controller: Optional[BudgetController] = budget_controller
 
         # Custom transport hook for unit test mocking without socket connection
@@ -197,6 +199,17 @@ class DeepSeekClient:
                     is_success=False,
                     error_message=f"Request rejected by budget controller: {err}",
                     reservation_id=req_id,
+                )
+        elif skip_budget_reservation and self.budget_controller is not None:
+            if not req_id:
+                raise BudgetException("Pre-transmission check failed: reservation_id is required when skip_budget_reservation=True.")
+            active_rec = self.budget_controller.active_reservations.get(req_id)
+            if active_rec is None:
+                raise BudgetException(f"Pre-transmission check failed: No active reservation found for '{req_id}'.")
+            if active_rec.max_output_tokens != payload["max_tokens"]:
+                raise BudgetException(
+                    f"Pre-transmission token mismatch: reservation '{req_id}' holds {active_rec.max_output_tokens} "
+                    f"output tokens, but request payload specifies {payload['max_tokens']}."
                 )
 
         # ---------------------------------------------------------------------

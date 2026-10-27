@@ -423,3 +423,153 @@ def test_12_no_double_reserve_double_reconcile_or_double_charge():
         expected_cost = (100 * 1.32 / 1_000_000) + (50 * 0.044 / 1_000_000) + (30 * 3.96 / 1_000_000)
         assert pytest.approx(controller.cumulative_spend, abs=1e-6) == expected_cost
         assert controller.permanently_locked_spend == 0.0
+
+
+# -----------------------------------------------------------------------------
+# Test 13: Input-bound rejection before dispatch and zero active hold leaks
+# -----------------------------------------------------------------------------
+
+def test_13_input_bound_rejection_before_dispatch():
+    """Confirms that oversized input exceeding MAX_INPUT_TOKEN_BOUND aborts before dispatch without active holds."""
+    controller = BudgetController(ceiling=0.80)
+    calls = []
+
+    def mock_sender(req, timeout):
+        calls.append(req)
+        return 200, b"{}"
+
+    client = DeepSeekClient(
+        api_key="sk-test-key",
+        budget_controller=controller,
+        max_output_tokens=1200,
+        transport_sender=mock_sender,
+    )
+    adapter = DeepSeekAgentAdapter(client)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        agent = AgentLoop(
+            workspace_root=tmp_dir,
+            llm_client=adapter,
+            budget_controller=controller,
+        )
+
+        oversized_prompt = "A" * 15000  # Token bound will exceed 8000
+        result = agent.run(oversized_prompt)
+
+        assert result.status == LoopTerminationStatus.BUDGET_EXCEEDED
+        assert "exceeds maximum input bound" in (result.error_message or "")
+        assert len(calls) == 0  # Zero network transmission attempted
+        assert controller.get_active_holds() == 0.0
+        assert controller.cumulative_spend == 0.0
+        assert controller.permanently_locked_spend == 0.0
+
+
+# -----------------------------------------------------------------------------
+# Test 14: Reservation cleanup after known pre-dispatch rejection
+# -----------------------------------------------------------------------------
+
+def test_14_reservation_cleanup_after_known_pre_dispatch_rejection():
+    """Confirms that pre-dispatch cancellation or refusal releases reservations cleanly."""
+    controller = BudgetController(ceiling=0.80)
+    cancel_evt = threading.Event()
+    cancel_evt.set()  # Signal cancellation before dispatch
+
+    calls = []
+
+    def mock_sender(req, timeout):
+        calls.append(req)
+        return 200, b"{}"
+
+    client = DeepSeekClient(
+        api_key="sk-test-key",
+        budget_controller=controller,
+        max_output_tokens=1200,
+        transport_sender=mock_sender,
+    )
+    adapter = DeepSeekAgentAdapter(client, cancel_event=cancel_evt)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        agent = AgentLoop(
+            workspace_root=tmp_dir,
+            llm_client=adapter,
+            budget_controller=controller,
+            cancel_event=cancel_evt,
+        )
+
+        result = agent.run("Do work but cancel")
+
+        assert result.status == LoopTerminationStatus.CANCELLED
+        assert len(calls) == 0  # Pre-dispatch cancellation prevented network transmission
+        assert controller.get_active_holds() == 0.0
+        assert controller.cumulative_spend == 0.0
+        assert controller.permanently_locked_spend == 0.0
+
+
+# -----------------------------------------------------------------------------
+# Test 15: Preservation of uncertain-outcome lock after transmission started
+# -----------------------------------------------------------------------------
+
+def test_15_preservation_of_uncertain_outcome_lock_after_transmission_started():
+    """Confirms that transport failures after transmission has begun lock reservation permanently."""
+    controller = BudgetController(ceiling=0.80)
+    res_id = "req-test-timeout"
+    reserved_amount = controller.reserve(res_id, "Sample prompt", max_output_tokens=1200)
+
+    # Transmission begins
+    controller.mark_transmission_started(res_id)
+    assert controller.active_reservations[res_id].state == ReservationState.TRANSMITTING
+
+    # Cannot release a transmitted reservation
+    with pytest.raises(BudgetException, match="transmission may have already started"):
+        controller.release_reservation(res_id)
+
+    # Record failure locks spend conservatively
+    controller.record_network_failure(res_id)
+    assert res_id not in controller.active_reservations
+    assert controller.get_active_holds() == 0.0
+    assert controller.permanently_locked_spend == reserved_amount
+    assert controller.cumulative_spend == reserved_amount
+    assert controller._all_reservations[res_id].state == ReservationState.PERMANENTLY_LOCKED
+
+
+# -----------------------------------------------------------------------------
+# Test 16: No retries after HTTP or transport failure
+# -----------------------------------------------------------------------------
+
+def test_16_no_retries_after_http_or_transport_failure():
+    """Confirms that HTTP 500/429 or socket errors result in zero automatic retries."""
+    controller = BudgetController(ceiling=0.80)
+    calls = []
+
+    def failing_sender(req, timeout):
+        calls.append(req)
+        raise urllib.error.HTTPError(
+            url=req.full_url,
+            code=500,
+            msg="Internal Server Error",
+            hdrs=req.headers,
+            fp=None,
+        )
+
+    client = DeepSeekClient(
+        api_key="sk-test-key",
+        budget_controller=controller,
+        max_output_tokens=1200,
+        transport_sender=failing_sender,
+    )
+    adapter = DeepSeekAgentAdapter(client)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        agent = AgentLoop(
+            workspace_root=tmp_dir,
+            llm_client=adapter,
+            budget_controller=controller,
+        )
+
+        result = agent.run("Ping with server failure")
+
+        assert result.status == LoopTerminationStatus.MALFORMED_RESPONSE_ABORTED
+        assert len(calls) == 1  # Exactly 1 call, zero automatic retries
+        assert controller.get_active_holds() == 0.0
+        assert controller.permanently_locked_spend > 0.0
+        assert controller.cumulative_spend == controller.permanently_locked_spend

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
-from src.budget_controller import BudgetController, BudgetExceededError, ReservationState
+from src.budget_controller import BudgetController, BudgetExceededError, BudgetException, ReservationState
 from src.path_security import PathSecurityError, safe_read_file, safe_write_file, validate_workspace_path
 
 
@@ -57,11 +57,25 @@ class DeepSeekAgentAdapter:
     def __init__(
         self,
         client: Any,
-        max_output_tokens: int = 1200,
+        max_output_tokens: Optional[int] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
+        client_tokens = getattr(client, "max_output_tokens", None)
+        if max_output_tokens is not None:
+            if not isinstance(max_output_tokens, int) or max_output_tokens <= 0 or max_output_tokens > 4096:
+                raise ValueError(f"max_output_tokens must be an integer between 1 and 4096, got {max_output_tokens}")
+            if client_tokens is not None and client_tokens != max_output_tokens:
+                raise ValueError(
+                    f"Adapter output limit ({max_output_tokens}) does not match client limit ({client_tokens})."
+                )
+            effective_tokens = max_output_tokens
+        elif client_tokens is not None:
+            effective_tokens = client_tokens
+        else:
+            effective_tokens = 1200
+
         self.client = client
-        self.max_output_tokens = max_output_tokens
+        self.max_output_tokens = effective_tokens
         self.cancel_event = cancel_event
 
     def chat_completion(
@@ -347,6 +361,7 @@ class AgentLoop:
         session_id: Optional[str] = None,
         tools_schema: Optional[List[Dict[str, Any]]] = None,
         authorized_target: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> None:
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
         self.llm_client = llm_client
@@ -358,6 +373,21 @@ class AgentLoop:
         self.session_id = session_id
         self.tools_schema = tools_schema if tools_schema is not None else self.TOOLS_SCHEMA
         self.authorized_target = authorized_target
+
+        client_tokens = getattr(llm_client, "max_output_tokens", None)
+        if max_output_tokens is not None:
+            if not isinstance(max_output_tokens, int) or max_output_tokens <= 0 or max_output_tokens > 4096:
+                raise ValueError(f"max_output_tokens must be an integer between 1 and 4096, got {max_output_tokens}")
+            if client_tokens is not None and client_tokens != max_output_tokens:
+                raise ValueError(
+                    f"AgentLoop max_output_tokens ({max_output_tokens}) does not match client tokens ({client_tokens})."
+                )
+            self.max_output_tokens = max_output_tokens
+        elif client_tokens is not None:
+            self.max_output_tokens = client_tokens
+        else:
+            self.max_output_tokens = getattr(self.budget_controller, "DEFAULT_OUTPUT_TOKENS", 1200)
+
         self.transcript: List[TranscriptEntry] = []
         self._consecutive_failures = 0
         self._last_failing_signature = ""
@@ -390,14 +420,24 @@ class AgentLoop:
 
             # 1. Budget reservation gate
             prompt_context = json.dumps(messages)
+            if self.max_output_tokens > self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS:
+                return AgentLoopResult(
+                    status=LoopTerminationStatus.BUDGET_EXCEEDED,
+                    total_turns=turn_index - 1,
+                    transcript=self.transcript,
+                    error_message=(
+                        f"Output token limit mismatch: AgentLoop output tokens ({self.max_output_tokens}) "
+                        f"exceeds BudgetController limit ({self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS})."
+                    ),
+                )
             try:
                 self.budget_controller.reserve(
                     reservation_id=reservation_id,
                     prompt_text=prompt_context,
-                    max_output_tokens=self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS,
+                    max_output_tokens=self.max_output_tokens,
                     description=f"Turn {turn_index}",
                 )
-            except BudgetExceededError as err:
+            except (BudgetExceededError, BudgetException) as err:
                 return AgentLoopResult(
                     status=LoopTerminationStatus.BUDGET_EXCEEDED,
                     total_turns=turn_index - 1,

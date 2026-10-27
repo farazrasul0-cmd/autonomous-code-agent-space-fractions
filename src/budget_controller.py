@@ -65,7 +65,8 @@ class BudgetController:
     # Default limits
     INTERNAL_CEILING: float = 0.80
     HARD_MAX_CEILING: float = 1.00
-    MAX_PERMITTED_OUTPUT_TOKENS: int = 1200
+    MAX_PERMITTED_OUTPUT_TOKENS: int = 4096
+    DEFAULT_OUTPUT_TOKENS: int = 1200
     MAX_INPUT_TOKEN_BOUND: int = 8000
     MAX_PAYLOAD_CHAR_LIMIT: int = 24000
 
@@ -102,11 +103,15 @@ class BudgetController:
 
     @classmethod
     def calculate_request_token_bound(cls, payload: Any) -> int:
-        """Calculates a strict conservative token bound for complete serialized API request payloads.
+        """Calculates a conservative token bound for complete serialized API request payloads.
         
         Accounts for ChatML envelope markers, role tags, and tool schemas.
-        Guarantees that a trivial prompt inside an HTTP envelope (such as 34 chars)
-        strictly exceeds the provider's actual measured input tokens (e.g. 92 tokens).
+        
+        HONEST LIMITATION: This calculation is a client-side heuristic overestimation
+        based on serialized string length and structural overhead. It does not execute
+        the provider's proprietary remote BPE tokenizer and does not constitute an
+        absolute provider billing guarantee. It serves as a fail-closed preflight gate
+        to prevent transmitting grossly oversized requests.
         """
         import json
         framing_overhead = 64
@@ -138,7 +143,7 @@ class BudgetController:
         self,
         reservation_id: str,
         prompt_or_payload: Any = None,
-        max_output_tokens: int = MAX_PERMITTED_OUTPUT_TOKENS,
+        max_output_tokens: int = DEFAULT_OUTPUT_TOKENS,
         description: str = "",
         prompt_text: Any = None,
     ) -> float:
@@ -193,6 +198,11 @@ class BudgetController:
             raise BudgetException(
                 f"Calculated token bound ({token_bound}) exceeds maximum input bound of "
                 f"{self.MAX_INPUT_TOKEN_BOUND} tokens."
+            )
+
+        if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
+            raise BudgetException(
+                f"Requested output tokens must be a positive integer, got {max_output_tokens}."
             )
 
         if max_output_tokens > self.MAX_PERMITTED_OUTPUT_TOKENS:

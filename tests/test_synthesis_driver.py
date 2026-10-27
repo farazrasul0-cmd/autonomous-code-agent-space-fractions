@@ -50,6 +50,7 @@ from src.deepseek_client import (
     RequestOutcomeStatus,
 )
 from src.synthesis_driver import (
+    CommitState,
     SynthesisDriver,
     SynthesisResult,
     SynthesisStatus,
@@ -71,6 +72,39 @@ def guard_no_real_network_and_subprocesses(monkeypatch):
 
 DOC_PATH = "Architecture_Documentation.md"
 VIEW_PATH = "Architecture_View.md"
+
+VALID_FRACTION_MATH_CODE = '''class Fraction:
+    def __init__(self, numerator: int, denominator: int = 1):
+        if not isinstance(numerator, int) or not isinstance(denominator, int):
+            raise TypeError("Numerator and denominator must be integers.")
+        if denominator == 0:
+            raise ValueError("Denominator cannot be zero.")
+        self.n = numerator
+        self.d = denominator
+
+    def simplify(self):
+        return self
+
+    def add(self, other):
+        return self
+
+    def subtract(self, other):
+        return self
+
+    def compare(self, other):
+        return 0
+
+    def equals(self, other):
+        return True
+
+
+class MathQuestionGenerator:
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+
+    def generate(self, level: int = 1, index: int = 1):
+        return None
+'''
 
 
 # -----------------------------------------------------------------------------
@@ -163,7 +197,7 @@ def test_4_successful_mock_generation_and_bounded_file_write():
                                 name="write_file",
                                 arguments={
                                     "path": "space_fractions/fraction_math.py",
-                                    "content": "# Space Fractions Math Engine\ndef simplify(n, d):\n    return n, d\n",
+                                    "content": VALID_FRACTION_MATH_CODE,
                                 },
                             )
                         ],
@@ -188,7 +222,9 @@ def test_4_successful_mock_generation_and_bounded_file_write():
         assert res.status == SynthesisStatus.COMPLETED
         assert res.is_complete is True
         assert "space_fractions/fraction_math.py" in res.files_written
-        assert os.path.isfile(os.path.join(tmp_dir, "space_fractions/fraction_math.py"))
+        assert os.path.isfile(res.target_path)
+        # Workspace root target was not directly written/polluted
+        assert not os.path.exists(os.path.join(tmp_dir, "space_fractions", "fraction_math.py"))
 
         # Verify accounting
         assert res.active_holds == 0.0
@@ -604,7 +640,7 @@ def test_15_completion_requires_current_run_writing_exact_target():
                             ToolCall(
                                 tool_id="call_2",
                                 name="write_file",
-                                arguments={"path": "space_fractions/fraction_math.py", "content": "def add(): pass"},
+                                arguments={"path": "space_fractions/fraction_math.py", "content": VALID_FRACTION_MATH_CODE},
                             )
                         ],
                         status="SUCCESS",
@@ -618,6 +654,10 @@ def test_15_completion_requires_current_run_writing_exact_target():
         assert res2.status == SynthesisStatus.COMPLETED
         assert any("fraction_math.py" in f for f in res2.files_written)
         assert res2.is_complete is True
+        assert os.path.isfile(res2.target_path)
+        # Pre-existing workspace target was preserved untouched
+        with open(stale_target, "r", encoding="utf-8") as f:
+            assert f.read() == "# stale pre-existing code from prior run"
 
 
 # -----------------------------------------------------------------------------
@@ -815,7 +855,7 @@ def test_18_equivalent_normalized_relative_paths_and_workspace_escape_rejection(
                             ToolCall(
                                 tool_id="call_norm",
                                 name="write_file",
-                                arguments={"path": "space_fractions/../space_fractions/fraction_math.py", "content": "code"},
+                                arguments={"path": "space_fractions/../space_fractions/fraction_math.py", "content": VALID_FRACTION_MATH_CODE},
                             )
                         ],
                         status="SUCCESS",
@@ -829,6 +869,7 @@ def test_18_equivalent_normalized_relative_paths_and_workspace_escape_rejection(
         )
         assert res_norm.status == SynthesisStatus.COMPLETED
         assert res_norm.is_complete is True
+        assert os.path.isfile(res_norm.target_path)
 
         # Case B: Traversal escape in target_artifact
         driver_escape = SynthesisDriver(workspace_root=tmp_dir, llm_client=WriteNormalizedClient(), max_turns=3)
@@ -1056,7 +1097,7 @@ def test_23_bounded_synthesis_successful_write_and_completion():
                                 name="write_file",
                                 arguments={
                                     "path": "space_fractions/fraction_math.py",
-                                    "content": "class Fraction:\n    pass\n",
+                                    "content": VALID_FRACTION_MATH_CODE,
                                 },
                             )
                         ],
@@ -1071,10 +1112,13 @@ def test_23_bounded_synthesis_successful_write_and_completion():
         assert res.status == SynthesisStatus.COMPLETED
         assert res.is_complete is True
         assert "space_fractions/fraction_math.py" in res.files_written
-        written_path = os.path.join(tmp_dir, "space_fractions", "fraction_math.py")
+        written_path = res.target_path
         assert os.path.isfile(written_path)
         with open(written_path, "r", encoding="utf-8") as f:
-            assert "class Fraction" in f.read()
+            content = f.read()
+            assert "class Fraction" in content
+            assert "class MathQuestionGenerator" in content
+        assert not os.path.exists(os.path.join(tmp_dir, "space_fractions", "fraction_math.py"))
 
 
 # -----------------------------------------------------------------------------
@@ -1121,3 +1165,737 @@ def test_24_bounded_synthesis_safety_invariants_cancellation_and_blocked_command
         assert res_cancelled.status == SynthesisStatus.CANCELLED
         assert res_cancelled.active_holds == 0.0
         assert res_cancelled.is_complete is False
+
+
+# -----------------------------------------------------------------------------
+# Test 25: Canonical target file in workspace root preserved during and after synthesis
+# -----------------------------------------------------------------------------
+
+def test_25_original_file_preserved_in_workspace_root_during_and_after_synthesis():
+    """Validates that any existing file in the workspace root remains strictly untouched during synthesis."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        orig_dir = os.path.join(tmp_dir, "space_fractions")
+        os.makedirs(orig_dir, exist_ok=True)
+        orig_file = os.path.join(orig_dir, "fraction_math.py")
+        sentinel_content = "# CANONICAL EXISTING PRODUCTION CODE HASH: ABCDEF123456"
+        with open(orig_file, "w", encoding="utf-8") as f:
+            f.write(sentinel_content)
+
+        class MockValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Generating fraction math",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c1",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=MockValidClient(), max_turns=3)
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.COMPLETED
+        assert res.is_complete is True
+        # Generated code promoted to run directory
+        assert os.path.isfile(res.target_path)
+        assert res.target_path != orig_file
+        # Original file in workspace root remained 100% byte-for-byte identical
+        with open(orig_file, "r", encoding="utf-8") as f:
+            assert f.read() == sentinel_content
+
+
+# -----------------------------------------------------------------------------
+# Test 26: Syntactically broken code rejected by validator and staging preserved
+# -----------------------------------------------------------------------------
+
+def test_26_syntactically_broken_code_rejected_and_staging_preserved():
+    """Validates that syntactically broken code fails interface validation, is not promoted, and preserves staging."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class BrokenSyntaxClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing broken code",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_broken",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": "def broken_func(:\n    return 42\n",
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 30},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=BrokenSyntaxClient(), max_turns=3)
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.FAILED
+        assert res.is_complete is False
+        assert "Syntax error" in (res.error_message or "")
+        # Staging directory must be preserved on disk
+        staging_dir = res.details.get("staging_dir")
+        assert staging_dir is not None
+        assert os.path.isdir(staging_dir)
+        staged_file = os.path.join(staging_dir, "space_fractions", "fraction_math.py")
+        assert os.path.isfile(staged_file)
+        # Final directory not created
+        assert "run_dir" not in res.details
+
+
+# -----------------------------------------------------------------------------
+# Test 27: Missing Fraction or MathQuestionGenerator rejected by validator
+# -----------------------------------------------------------------------------
+
+def test_27_missing_fraction_or_generator_rejected_by_validator():
+    """Validates that code missing Fraction, MathQuestionGenerator, or required methods fails validation."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Case A: Missing Fraction class entirely
+        class MissingClassClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing partial module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_partial",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": "class MathQuestionGenerator:\n    def generate(self):\n        pass\n",
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 30},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=MissingClassClient(), max_turns=3)
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.FAILED
+        assert res.is_complete is False
+        assert "Missing required class 'Fraction'" in (res.error_message or "")
+        assert os.path.isdir(res.details["staging_dir"])
+
+        # Case B: Fraction missing required methods
+        class MissingMethodClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing incomplete fraction",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_missing_method",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": "class Fraction:\n    def __init__(self): pass\nclass MathQuestionGenerator:\n    def generate(self): pass\n",
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 30},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver2 = SynthesisDriver(workspace_root=tmp_dir, llm_client=MissingMethodClient(), max_turns=3)
+        res2 = driver2.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res2.status == SynthesisStatus.FAILED
+        assert res2.is_complete is False
+        assert "missing required methods" in (res2.error_message or "")
+        assert os.path.isdir(res2.details["staging_dir"])
+
+
+# -----------------------------------------------------------------------------
+# Test 28: Interface validator is actually invoked in the real synthesis path
+# -----------------------------------------------------------------------------
+
+def test_28_interface_validator_actually_invoked_in_synthesis_path():
+    """Proves with a spy that validate_fraction_math_interface is called on the staged target before promotion."""
+    from unittest.mock import MagicMock
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_spy",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+        spy_validator = MagicMock(side_effect=driver.validate_fraction_math_interface)
+        driver.validate_fraction_math_interface = spy_validator
+
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.COMPLETED
+        assert res.is_complete is True
+        assert spy_validator.call_count == 1
+        called_arg = spy_validator.call_args[0][0]
+        # Arg passed to validator must be inside staging directory
+        assert ".staging_" in called_arg
+        assert os.path.normpath(called_arg).endswith(os.path.normpath("space_fractions/fraction_math.py"))
+
+
+# -----------------------------------------------------------------------------
+# Test 29: Cancellation before promotion halts and preserves staging
+# -----------------------------------------------------------------------------
+
+def test_29_cancellation_before_promotion_halts_and_preserves_staging():
+    """Validates that a cancellation signaled before promotion halts the run and preserves staging."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cancel_evt = threading.Event()
+
+        class CancelTriggerClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing target",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_cancel",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                # Model completes turn 2, but set cancellation right as model returns
+                cancel_evt.set()
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(
+            workspace_root=tmp_dir,
+            llm_client=CancelTriggerClient(),
+            max_turns=3,
+            cancel_event=cancel_evt,
+        )
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.CANCELLED
+        assert res.is_complete is False
+        assert "cancelled" in (res.error_message or "").lower()
+        # Staging preserved
+        staging_dir = res.details.get("staging_dir")
+        assert staging_dir is not None
+        assert os.path.isdir(staging_dir)
+        # Final directory not created
+        assert "run_dir" not in res.details
+
+
+# -----------------------------------------------------------------------------
+# Test 30: Successful promotion is atomic and creates synthesis_manifest.json
+# -----------------------------------------------------------------------------
+
+def test_30_successful_promotion_atomic_and_writes_manifest():
+    """Validates that a valid run creates synthesis_manifest.json and atomically promotes staging."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing target",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_manifest",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.COMPLETED
+        assert res.is_complete is True
+        assert os.path.isfile(res.target_path)
+        run_dir = res.details["run_dir"]
+        assert os.path.isdir(run_dir)
+
+        manifest_path = res.details["manifest_path"]
+        assert os.path.isfile(manifest_path)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+
+        assert manifest_data["status"] == "COMPLETED"
+        assert manifest_data["validation"] == "PASSED"
+        assert manifest_data["target_artifact"] == "space_fractions/fraction_math.py"
+        assert manifest_data["total_turns"] == res.total_turns
+        assert "space_fractions/fraction_math.py" in manifest_data["files_written"]
+
+        # Staging directory no longer exists (atomically renamed to run_dir)
+        staging_dir = os.path.join(tmp_dir, f".staging_{res.details['session_id']}")
+        assert not os.path.exists(staging_dir)
+
+
+# -----------------------------------------------------------------------------
+# Test 31: Destination directory collision fails safely and preserves staging
+# -----------------------------------------------------------------------------
+
+def test_31_destination_directory_collision_fails_safely():
+    """Validates that if the destination directory exists, synthesis fails safely without overwriting."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def chat_completion(self, messages, tools, reservation_id=None):
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        colliding_dir = os.path.join(tmp_dir, "colliding_run")
+        os.makedirs(colliding_dir, exist_ok=True)
+        with open(os.path.join(colliding_dir, "existing.txt"), "w", encoding="utf-8") as f:
+            f.write("existing content")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+        res = driver.run_synthesis(
+            DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py", destination_dir=colliding_dir
+        )
+
+        assert res.status == SynthesisStatus.FAILED
+        assert res.is_complete is False
+        assert "Destination directory collision" in (res.error_message or "")
+        # Colliding destination file was preserved
+        with open(os.path.join(colliding_dir, "existing.txt"), "r", encoding="utf-8") as f:
+            assert f.read() == "existing content"
+
+
+# -----------------------------------------------------------------------------
+# Test 32: Manifest creation failure preserves staging and aborts promotion
+# -----------------------------------------------------------------------------
+
+def test_32_manifest_write_failure_preserves_staging_and_aborts_promotion():
+    """Validates that if synthesis manifest write fails, staging is preserved and promotion aborts."""
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing target",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_mf_fail",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+
+        real_open = open
+        def faulty_open(path, *args, **kwargs):
+            if "synthesis_manifest.json" in str(path):
+                raise OSError("Simulated disk error writing manifest")
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=faulty_open):
+            res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.FAILED
+        assert res.is_complete is False
+        assert "Failed to write synthesis manifest" in (res.error_message or "")
+        staging_dir = res.details["staging_dir"]
+        assert os.path.isdir(staging_dir)
+        assert "run_dir" not in res.details
+
+
+# -----------------------------------------------------------------------------
+# Test 33: Path traversal in target_artifact rejected preflight
+# -----------------------------------------------------------------------------
+
+def test_33_path_traversal_in_target_artifact_rejected_preflight():
+    """Validates that directory traversal attempts in target_artifact are rejected before loop execution."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        driver = SynthesisDriver(workspace_root=tmp_dir)
+
+        # Relative escape
+        res_rel = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="../../escaped.py")
+        assert res_rel.status == SynthesisStatus.FAILED
+        assert res_rel.is_complete is False
+        assert "escapes workspace root" in (res_rel.error_message or "")
+
+        # Absolute escape
+        res_abs = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="/etc/passwd")
+        assert res_abs.status == SynthesisStatus.FAILED
+        assert res_abs.is_complete is False
+        assert "escapes workspace root" in (res_abs.error_message or "")
+
+
+# -----------------------------------------------------------------------------
+# Test 34: Concurrency Ordering A - Cancellation wins the commit boundary first
+# -----------------------------------------------------------------------------
+
+def test_34_concurrency_cancellation_wins_commit_boundary_first():
+    """Validates that when cancellation is requested prior to claiming COMMITTING,
+
+    cancellation wins, promotion is aborted, and staging remains intact.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_conc_a",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+
+        worker_at_pre_commit = threading.Event()
+        resume_worker = threading.Event()
+
+        def pre_commit_hook():
+            worker_at_pre_commit.set()
+            resume_worker.wait()
+
+        driver._pre_commit_hook = pre_commit_hook
+
+        worker_result: Dict[str, Any] = {}
+
+        def worker_target():
+            worker_result["res"] = driver.run_synthesis(
+                DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py"
+            )
+
+        worker_thread = threading.Thread(target=worker_target)
+        worker_thread.start()
+
+        # Deterministically wait until worker has generated code, validated interface, written manifest,
+        # and is paused right before claiming the commit lock
+        assert worker_at_pre_commit.wait(timeout=5.0)
+
+        # Main thread requests cancellation under commit_lock BEFORE worker enters commit
+        cancel_accepted = driver.request_cancellation()
+        assert cancel_accepted is True
+        assert driver.commit_state == CommitState.CANCELLED
+
+        # Release worker to proceed to commit boundary
+        resume_worker.set()
+        worker_thread.join(timeout=5.0)
+
+        res: SynthesisResult = worker_result["res"]
+        # Run reports CANCELLED
+        assert res.status == SynthesisStatus.CANCELLED
+        assert res.is_complete is False
+        assert "run_dir" not in res.details
+
+        # No final destination directory exists
+        for item in os.listdir(tmp_dir):
+            assert not item.startswith("synthesis_run_")
+
+        # Staging remains available for inspection
+        staging_dir = res.details.get("staging_dir")
+        assert staging_dir is not None
+        assert os.path.isdir(staging_dir)
+        staged_target = os.path.join(staging_dir, "space_fractions", "fraction_math.py")
+        assert os.path.isfile(staged_target)
+        manifest_file = os.path.join(staging_dir, "synthesis_manifest.json")
+        assert os.path.isfile(manifest_file)
+
+
+# -----------------------------------------------------------------------------
+# Test 35: Concurrency Ordering B - Worker wins the commit boundary first
+# -----------------------------------------------------------------------------
+
+def test_35_concurrency_worker_wins_commit_boundary_first():
+    """Validates that when the worker claims COMMITTING first under the lock,
+
+    subsequent cancellation is rejected, promotion completes, and CANCELLED is never reported.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_conc_b",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+
+        worker_in_committing = threading.Event()
+        resume_promotion = threading.Event()
+
+        def in_commit_hook():
+            # Called inside with driver.commit_lock, after self.commit_state = CommitState.COMMITTING
+            worker_in_committing.set()
+            resume_promotion.wait()
+
+        driver._in_commit_hook = in_commit_hook
+
+        worker_result: Dict[str, Any] = {}
+
+        def worker_target():
+            worker_result["res"] = driver.run_synthesis(
+                DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py"
+            )
+
+        worker_thread = threading.Thread(target=worker_target)
+        worker_thread.start()
+
+        # Deterministically wait until worker has entered commit_lock and claimed COMMITTING
+        assert worker_in_committing.wait(timeout=5.0)
+
+        # Thread 2 attempts to request cancellation while worker holds commit_lock in COMMITTING
+        cancel_attempt_result: Dict[str, Any] = {}
+
+        def cancel_attempt_target():
+            cancel_attempt_result["accepted"] = driver.request_cancellation()
+
+        cancel_thread = threading.Thread(target=cancel_attempt_target)
+        cancel_thread.start()
+
+        # Release worker to proceed with os.rename and transition to COMMITTED
+        resume_promotion.set()
+
+        # Both threads finish cleanly
+        worker_thread.join(timeout=5.0)
+        cancel_thread.join(timeout=5.0)
+
+        # Cancellation was rejected as too late
+        assert cancel_attempt_result["accepted"] is False
+
+        res: SynthesisResult = worker_result["res"]
+        # Run reports COMPLETED, never CANCELLED
+        assert res.status == SynthesisStatus.COMPLETED
+        assert res.is_complete is True
+        assert os.path.isfile(res.target_path)
+        assert driver.commit_state == CommitState.COMMITTED
+
+        # Destination directory exists and contains promoted artifacts
+        run_dir = res.details["run_dir"]
+        assert os.path.isdir(run_dir)
+        assert os.path.isfile(res.details["manifest_path"])
+
+
+# -----------------------------------------------------------------------------
+# Test 36: Cancellation rejected after terminal FAILED state
+# -----------------------------------------------------------------------------
+
+def test_36_cancellation_rejected_after_terminal_failed_state():
+    """Validates that once a run enters terminal FAILED state (e.g. promotion error),
+
+    subsequent cancellation requests return False and preserve FAILED state.
+    """
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class ValidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_fail_test",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": VALID_FRACTION_MATH_CODE,
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=ValidClient(), max_turns=3)
+
+        # Trigger a promotion failure by simulating OSError on os.rename
+        with patch("os.rename", side_effect=OSError("Simulated rename sharing violation")):
+            res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.FAILED
+        assert res.is_complete is False
+        assert driver.commit_state == CommitState.FAILED
+
+        # Attempt to cancel AFTER the run has reached terminal FAILED state
+        cancel_accepted = driver.request_cancellation()
+        assert cancel_accepted is False
+        # State must remain strictly FAILED
+        assert driver.commit_state == CommitState.FAILED
+
+
+# -----------------------------------------------------------------------------
+# Test 37: Repeated cancellation after terminal CANCELLED state returns False
+# -----------------------------------------------------------------------------
+
+def test_37_repeated_cancellation_after_terminal_cancelled_state_returns_false():
+    """Validates that once a run is in terminal CANCELLED state,
+
+    subsequent cancellation requests return False and preserve CANCELLED.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        driver = SynthesisDriver(workspace_root=tmp_dir)
+
+        # First cancellation before or during execution succeeds
+        first_cancel = driver.request_cancellation()
+        assert first_cancel is True
+        assert driver.commit_state == CommitState.CANCELLED
+
+        # Second cancellation must be rejected as redundant and cannot alter state
+        second_cancel = driver.request_cancellation()
+        assert second_cancel is False
+        assert driver.commit_state == CommitState.CANCELLED
+
+
+# -----------------------------------------------------------------------------
+# Test 38: Cancellation rejected after interface validation failure
+# -----------------------------------------------------------------------------
+
+def test_38_cancellation_rejected_after_interface_validation_failure():
+    """Validates that a run failing interface validation enters FAILED,
+
+    and subsequent cancellation is rejected without changing state.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        class IncompleteClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_completion(self, messages, tools, reservation_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurnResponse(
+                        content="Writing broken module",
+                        tool_calls=[
+                            ToolCall(
+                                tool_id="c_broken",
+                                name="write_file",
+                                arguments={
+                                    "path": "space_fractions/fraction_math.py",
+                                    "content": "class Incomplete: pass\n",
+                                },
+                            )
+                        ],
+                        raw_usage={"prompt_tokens": 100, "completion_tokens": 50},
+                        status="SUCCESS",
+                    )
+                return ModelTurnResponse(content="Done", tool_calls=[], status="SUCCESS")
+
+        driver = SynthesisDriver(workspace_root=tmp_dir, llm_client=IncompleteClient(), max_turns=3)
+        res = driver.run_synthesis(DOC_PATH, VIEW_PATH, target_artifact="space_fractions/fraction_math.py")
+
+        assert res.status == SynthesisStatus.FAILED
+        assert driver.commit_state == CommitState.FAILED
+
+        # Attempt to cancel after validation failure
+        cancel_accepted = driver.request_cancellation()
+        assert cancel_accepted is False
+        assert driver.commit_state == CommitState.FAILED
