@@ -6,7 +6,7 @@ Provides:
 2. File pickers for canonical Architecture_Documentation.md and Architecture_View.md.
 3. Destination output directory selection.
 4. Task trigger and cancel controls with background worker thread and thread-safe queue.
-5. Real-time budget telemetry distinguishing verified live spend ($0.000186) from active holds.
+5. Real-time budget telemetry distinguishing verified live spend (UNRECONCILED baseline) from active holds.
 6. Execution of the offline specification preprocessor and staged generator pipeline.
 7. Multi-tab activity log, extracted view/entity details, and generated artifact summaries.
 
@@ -20,17 +20,57 @@ SAFETY & CREDENTIAL NOTICE:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import queue
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
+
+def _bootstrap_tcl_tk_environment() -> None:
+    """Ensure TCL_LIBRARY, TK_LIBRARY, and TCLLIBPATH point to valid bundled directories containing init.tcl and tk.tcl."""
+    if hasattr(sys, "_MEIPASS"):
+        meipass = getattr(sys, "_MEIPASS")
+        # Find directory containing init.tcl
+        tcl_candidates = [
+            os.path.join(meipass, "_tcl_data"),
+            os.path.join(meipass, "tcl", "tcl8.6"),
+            os.path.join(meipass, "tcl8.6"),
+            os.path.join(meipass, "_tcl_data", "tcl8.6"),
+        ]
+        for cand in tcl_candidates:
+            if os.path.isfile(os.path.join(cand, "init.tcl")):
+                os.environ["TCL_LIBRARY"] = cand
+                break
+
+        # Find directory containing tk.tcl
+        tk_candidates = [
+            os.path.join(meipass, "_tk_data"),
+            os.path.join(meipass, "tcl", "tk8.6"),
+            os.path.join(meipass, "tk8.6"),
+            os.path.join(meipass, "_tk_data", "tk8.6"),
+        ]
+        for cand in tk_candidates:
+            if os.path.isfile(os.path.join(cand, "tk.tcl")):
+                os.environ["TK_LIBRARY"] = cand
+                break
+
+        tcl8_dir = os.path.join(meipass, "tcl8")
+        if os.path.isdir(tcl8_dir):
+            existing = os.environ.get("TCLLIBPATH", "")
+            if meipass not in existing:
+                os.environ["TCLLIBPATH"] = f"{meipass} {existing}".strip()
+
+
+_bootstrap_tcl_tk_environment()
+
 import tkinter as tk
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -48,6 +88,7 @@ from src.agent_loop import (
     ToolCall,
 )
 from src.budget_controller import BudgetController
+from src.command_validator import redact_secrets
 from src.deepseek_client import DeepSeekClient
 from src.generator_pipeline import OfflinePipelineCoordinator, PipelineExecutionSummary
 from src.path_security import PathSecurityError, safe_write_file, validate_workspace_path
@@ -78,6 +119,71 @@ def resolve_input_file(filename: str) -> str:
     if os.path.isfile(bundled):
         return os.path.abspath(bundled)
     return os.path.abspath(filename)
+
+
+STARTUP_RECEIPT_SCHEMA_VERSION = 1
+
+
+def startup_receipt_directory(workspace_root: Optional[str] = None) -> str:
+    """Return the deterministic local diagnostic directory for unattended startup."""
+    root = workspace_root or os.getcwd()
+    return os.path.join(os.path.realpath(os.path.abspath(root)), ".code_agent_diagnostics")
+
+
+def _write_startup_receipt(receipt_path: str, receipt: Dict[str, Any]) -> bool:
+    """Atomically persist a sanitized receipt; never expose an underlying error."""
+    try:
+        os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".startup_", suffix=".json", dir=os.path.dirname(receipt_path)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as receipt_file:
+                json.dump(receipt, receipt_file, sort_keys=True, indent=2)
+                receipt_file.write("\n")
+            os.replace(temporary_path, receipt_path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class WorkerRunConfig:
+    """Immutable snapshot of execution configuration captured on GUI thread before worker spawn."""
+
+    run_id: str
+    doc_path: str
+    view_path: str
+    output_dir: str
+    execution_mode: str
+    task_goal: str
+    allow_live_dispatch: bool
+    api_key: str = ""
+    live_timeout: float = 60.0
+    max_turns: int = 12
+    workflow_mode: str = "offline_pipeline"
+    live_max_output_tokens: int = 2500
+    startup_receipt_path: Optional[str] = None
+    resume_staging: Optional[str] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"WorkerRunConfig(run_id='{self.run_id}', doc_path='{self.doc_path}', "
+            f"view_path='{self.view_path}', output_dir='{self.output_dir}', "
+            f"execution_mode='{self.execution_mode}', task_goal='{self.task_goal}', "
+            f"allow_live_dispatch={self.allow_live_dispatch}, api_key='[PROTECTED_AND_REDACTED]', "
+            f"live_timeout={self.live_timeout}, max_turns={self.max_turns}, "
+            f"workflow_mode='{self.workflow_mode}')"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 class QueueMessage(tuple):
@@ -264,8 +370,8 @@ class AgentGUIApp:
     DEFAULT_VIEW_FILE = "Architecture_View.md"
     DEFAULT_OUTPUT_DIR = "generated_space_fractions"
 
-    # Verified cumulative live spend from Gate E verification
-    BASE_VERIFIED_SPEND = 0.000186
+    # Historical spend baseline (unreconciled without centralized repository ledger)
+    BASE_VERIFIED_SPEND: Optional[float] = None
     HARD_CEILING = 0.800000
 
     def __init__(
@@ -277,6 +383,7 @@ class AgentGUIApp:
         mock_llm_client: Optional[LLMClientProtocol] = None,
         allow_live_dispatch: bool = False,
         workflow_mode: str = "offline_pipeline",
+        live_max_output_tokens: int = 2500,
         synthesis_runner_factory: Optional[Callable[..., Any]] = None,
         default_execution_mode: str = "offline",
         default_output_dir: Optional[str] = None,
@@ -284,6 +391,7 @@ class AgentGUIApp:
         default_task: Optional[str] = None,
         max_turns: int = 12,
         live_timeout: float = 60.0,
+        resume_staging: Optional[str] = None,
     ) -> None:
         self.root = root
         self.auto_run = auto_run
@@ -298,6 +406,8 @@ class AgentGUIApp:
         self.default_task = default_task
         self.max_turns = max_turns
         self.live_timeout = max(1.0, float(live_timeout))
+        self.live_max_output_tokens = min(4096, max(500, int(live_max_output_tokens)))
+        self.resume_staging = resume_staging
         self._game_window: Optional[tk.Toplevel] = None
         self._game_app: Optional[Any] = None
 
@@ -315,6 +425,8 @@ class AgentGUIApp:
         self.current_run_id: Optional[str] = None
         self.last_staging_dir: Optional[str] = None
         self.last_run_dir: Optional[str] = None
+        self.startup_receipt_path: Optional[str] = None
+        self._startup_receipt: Optional[Dict[str, Any]] = None
         self._pre_commit_hook: Optional[Callable[[], None]] = None
         self._in_commit_hook: Optional[Callable[[], None]] = None
 
@@ -322,8 +434,9 @@ class AgentGUIApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_closing)
 
         # Budget tracking instance
+        self.has_authoritative_history = False
         self.budget_controller = BudgetController(ceiling=self.HARD_CEILING)
-        self.budget_controller.cumulative_spend = self.BASE_VERIFIED_SPEND
+        self.budget_controller.cumulative_spend = 0.0
 
         # Extracted results cache
         self.last_preprocess_result: Optional[SpecificationPreprocessResult] = None
@@ -524,35 +637,61 @@ class AgentGUIApp:
         mode_frame = ttk.Frame(parent)
         mode_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(mode_frame, text="RUN MODE: ").pack(side=tk.LEFT)
-        self.lbl_mode_badge = ttk.Label(mode_frame, text="OFFLINE VALIDATION (Mock Engine)", style="ModeBadge.TLabel")
-        self.lbl_mode_badge.pack(side=tk.LEFT)
+        self.lbl_mode_badge = ttk.Label(
+            mode_frame,
+            text="OFFLINE VALIDATION (Mock Engine)",
+            style="ModeBadge.TLabel",
+            wraplength=220,
+            justify=tk.LEFT,
+        )
+        self.lbl_mode_badge.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Telemetry Grid
         grid_frame = ttk.Frame(parent)
         grid_frame.pack(fill=tk.BOTH, expand=True)
 
         items = [
-            ("Cumulative Verified Live Spend:", "$0.000186", "#2B6CB0"),
+            ("Cumulative Verified Live Spend:", "UNRECONCILED", "#475569"),
             ("Active Reserved Hold:", "$0.000000", "#D69E2E"),
             ("Hard Project Budget Ceiling:", "$0.800000", "#2D3748"),
-            ("Remaining Available Budget:", "$0.799814", "#38A169"),
+            ("Remaining Available Budget:", "UNRECONCILED", "#475569"),
         ]
 
         self.telemetry_labels: Dict[str, ttk.Label] = {}
         for r_idx, (title, default_val, color) in enumerate(items):
-            ttk.Label(grid_frame, text=title, font=("Segoe UI", 9)).grid(row=r_idx*2, column=0, sticky=tk.W, pady=(2, 0))
-            val_lbl = ttk.Label(grid_frame, text=default_val, font=("Segoe UI", 10, "bold"), foreground=color)
-            val_lbl.grid(row=r_idx*2+1, column=0, sticky=tk.W, pady=(0, 4))
+            ttk.Label(grid_frame, text=title, font=("Segoe UI", 9)).grid(
+                row=r_idx * 2, column=0, sticky=tk.W, pady=(2, 0)
+            )
+            val_lbl = ttk.Label(
+                grid_frame, text=default_val, font=("Segoe UI", 10, "bold"), foreground=color
+            )
+            val_lbl.grid(row=r_idx * 2 + 1, column=0, sticky=tk.W, pady=(0, 4))
             self.telemetry_labels[title] = val_lbl
 
-        # Security note
-        ttk.Label(
+        # Security note & accounting disclaimer
+        disclaimer_text = (
+            "• Historical multi-stage spend is UNRECONCILED (disparate test runs).\n"
+            "• $0.80 ceiling is a client-side reservation guard, not a provider cap.\n"
+            "• In offline mode, zero network calls or HTTP packets are sent."
+        )
+        self.lbl_disclaimer = ttk.Label(
             parent,
-            text="* Verified spend reflects actual Gate E telemetry.\n* No network calls are dispatched in offline mode.",
+            text=disclaimer_text,
             font=("Segoe UI", 8),
             foreground="#718096",
             justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(6, 0))
+            wraplength=220,
+        )
+        self.lbl_disclaimer.pack(anchor=tk.W, fill=tk.X, expand=False, pady=(6, 0))
+
+        def _on_parent_configure(event: Any) -> None:
+            new_wrap = max(160, event.width - 24)
+            if hasattr(self, "lbl_mode_badge"):
+                self.lbl_mode_badge.configure(wraplength=new_wrap)
+            if hasattr(self, "lbl_disclaimer"):
+                self.lbl_disclaimer.configure(wraplength=new_wrap)
+
+        parent.bind("<Configure>", _on_parent_configure)
 
     def _on_execution_mode_changed(self, *args: Any) -> None:
         """Updates UI status and mode badge when execution mode changes."""
@@ -946,6 +1085,53 @@ class AgentGUIApp:
                 return
         self.on_window_closing()
 
+    def _begin_startup_receipt(self) -> None:
+        """Create the pre-validation receipt used only by unattended startup."""
+        if not (self.auto_run or self.suppress_messagebox):
+            return
+        run_id = uuid.uuid4().hex
+        receipt_path = os.path.join(
+            startup_receipt_directory(), f"startup_{run_id[:12]}.json"
+        )
+        receipt = {
+            "schema_version": STARTUP_RECEIPT_SCHEMA_VERSION,
+            "startup_run_id": run_id,
+            "timestamp_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "unattended": bool(self.auto_run),
+            "message_boxes_suppressed": bool(self.suppress_messagebox),
+            "working_directory_status": "PRESENT" if os.path.isdir(os.getcwd()) else "UNAVAILABLE",
+            "architecture_input_validation_status": "NOT_STARTED",
+            "output_directory_initialization_status": "NOT_STARTED",
+            "worker_initialization_status": "NOT_STARTED",
+            "startup_outcome": "STARTED",
+            "failure_category": "NONE",
+        }
+        self.startup_receipt_path = receipt_path
+        self._startup_receipt = receipt
+        if not _write_startup_receipt(receipt_path, receipt):
+            self.startup_receipt_path = None
+            self._startup_receipt = None
+            self._append_log("STARTUP_DIAGNOSTIC receipt_write_failed", "ERROR")
+
+    def _update_startup_receipt(self, **updates: Any) -> None:
+        """Persist sanitized startup state without letting diagnostics affect execution."""
+        if not self._startup_receipt or not self.startup_receipt_path:
+            return
+        self._startup_receipt.update(updates)
+        if not _write_startup_receipt(self.startup_receipt_path, self._startup_receipt):
+            self._append_log("STARTUP_DIAGNOSTIC receipt_write_failed", "ERROR")
+
+    def _startup_validation_failed(self, category: str, title: str, message: str) -> None:
+        """Record a fixed failure category and retain dialogs only for interactive use."""
+        self._update_startup_receipt(
+            architecture_input_validation_status="FAILED",
+            startup_outcome="VALIDATION_FAILED",
+            failure_category=category,
+        )
+        self._append_log(f"STARTUP_VALIDATION_FAILED category={category}", "ERROR")
+        if not self.suppress_messagebox:
+            messagebox.showerror(title, message)
+
     def on_window_closing(self) -> None:
         """Handles user window close: safely aborts running task or defers if in COMMITTING."""
         with self._state_lock:
@@ -990,37 +1176,32 @@ class AgentGUIApp:
             if self.is_running:
                 return
 
+            self._begin_startup_receipt()
+            self._update_startup_receipt(startup_outcome="VALIDATING_INPUTS")
+
             mode_str = self.execution_mode_var.get()
             if mode_str == "live" and not self.allow_live_dispatch:
-                self._append_log(
-                    "SECURITY REJECTION: Live mode dispatch is blocked by fail-closed safety policy (allow_live_dispatch=False).",
-                    "ERROR",
+                self._startup_validation_failed(
+                    "LIVE_DISPATCH_NOT_AUTHORIZED",
+                    "Execution Blocked",
+                    "Live mode execution is not authorized without explicit allow_live_dispatch=True.",
                 )
-                if not getattr(self, "suppress_messagebox", False):
-                    messagebox.showerror(
-                        "Execution Blocked",
-                        "Live mode execution is not authorized without explicit allow_live_dispatch=True.",
-                    )
                 return
 
+            raw_key = ""
             if mode_str == "live":
                 raw_key = self.api_key_var.get().strip()
                 if not raw_key:
-                    self._append_log(
-                        "SECURITY REJECTION: Live mode execution requires a valid DeepSeek API key.",
-                        "ERROR",
+                    self._startup_validation_failed(
+                        "LIVE_CREDENTIAL_UNAVAILABLE",
+                        "API Key Required",
+                        "Live mode execution requires a configured credential.",
                     )
-                    if not getattr(self, "suppress_messagebox", False):
-                        messagebox.showerror(
-                            "API Key Required",
-                            "Live mode execution requires a non-empty DeepSeek API key in the configuration field.",
-                        )
                     return
 
             task_goal = self.task_desc_var.get().strip() if hasattr(self, "task_desc_var") else ""
             if not task_goal:
-                if not getattr(self, "suppress_messagebox", False):
-                    messagebox.showerror("Invalid Input", "Task Goal cannot be empty.")
+                self._startup_validation_failed("TASK_GOAL_MISSING", "Invalid Input", "Task Goal cannot be empty.")
                 return
 
             doc_path = self.doc_path_var.get().strip()
@@ -1029,40 +1210,42 @@ class AgentGUIApp:
 
             # Validate existence, readability, and content of input files
             if not doc_path or not os.path.isfile(doc_path):
-                messagebox.showerror("Invalid Input", f"Architecture documentation file not found:\n{doc_path}")
+                self._startup_validation_failed("ARCHITECTURE_DOCUMENT_MISSING", "Invalid Input", "Architecture documentation file not found.")
                 return
             try:
                 if os.path.getsize(doc_path) == 0:
-                    messagebox.showerror("Invalid Input", f"Architecture documentation file is empty (0 bytes):\n{doc_path}")
+                    self._startup_validation_failed("ARCHITECTURE_DOCUMENT_EMPTY", "Invalid Input", "Architecture documentation file is empty.")
                     return
                 with open(doc_path, "r", encoding="utf-8") as f:
                     f.read(256)
-            except Exception as e:
-                messagebox.showerror("Invalid Input", f"Cannot read architecture documentation file: {e}")
+            except Exception:
+                self._startup_validation_failed("ARCHITECTURE_DOCUMENT_UNREADABLE", "Invalid Input", "Architecture documentation file cannot be read.")
                 return
 
             if not view_path or not os.path.isfile(view_path):
-                messagebox.showerror("Invalid Input", f"Architecture view file not found:\n{view_path}")
+                self._startup_validation_failed("ARCHITECTURE_VIEW_MISSING", "Invalid Input", "Architecture view file not found.")
                 return
             try:
                 if os.path.getsize(view_path) == 0:
-                    messagebox.showerror("Invalid Input", f"Architecture view file is empty (0 bytes):\n{view_path}")
+                    self._startup_validation_failed("ARCHITECTURE_VIEW_EMPTY", "Invalid Input", "Architecture view file is empty.")
                     return
                 with open(view_path, "r", encoding="utf-8") as f:
                     f.read(256)
-            except Exception as e:
-                messagebox.showerror("Invalid Input", f"Cannot read architecture view file: {e}")
+            except Exception:
+                self._startup_validation_failed("ARCHITECTURE_VIEW_UNREADABLE", "Invalid Input", "Architecture view file cannot be read.")
                 return
 
             if not output_dir:
-                messagebox.showerror("Invalid Input", "Output directory cannot be empty.")
+                self._startup_validation_failed("OUTPUT_DIRECTORY_MISSING", "Invalid Input", "Output directory cannot be empty.")
                 return
             if "\0" in output_dir:
-                messagebox.showerror("Invalid Input", "Null bytes detected in output path.")
+                self._startup_validation_failed("OUTPUT_DIRECTORY_INVALID", "Invalid Input", "Output directory is invalid.")
                 return
             if output_dir.startswith(("\\\\", "//")):
-                messagebox.showerror("Invalid Input", f"UNC network paths are prohibited:\n{output_dir}")
+                self._startup_validation_failed("OUTPUT_DIRECTORY_UNSUPPORTED", "Invalid Input", "Network output directories are prohibited.")
                 return
+
+            self._update_startup_receipt(architecture_input_validation_status="VALID")
 
             # Prepare UI state for running
             self.is_running = True
@@ -1081,13 +1264,47 @@ class AgentGUIApp:
         self._append_log(f"Starting run {run_id[:8]} (Mode: {mode_str})...", "INFO")
         self.status_var.set("Running preprocessor and pipeline...")
 
-        # Spawn background worker
-        self.worker_thread = threading.Thread(
-            target=self._run_offline_pipeline_worker,
-            args=(doc_path, view_path, output_dir, run_id, mode_str),
-            daemon=True,
+        # Capture plain immutable configuration snapshot on GUI thread before spawning worker
+        config = WorkerRunConfig(
+            run_id=run_id,
+            doc_path=doc_path,
+            view_path=view_path,
+            output_dir=output_dir,
+            execution_mode=mode_str,
+            task_goal=task_goal,
+            allow_live_dispatch=self.allow_live_dispatch,
+            api_key=raw_key if mode_str == "live" else "",
+            live_timeout=getattr(self, "live_timeout", 60.0),
+            max_turns=getattr(self, "max_turns", 12),
+            workflow_mode=getattr(self, "workflow_mode", "offline_pipeline"),
+            live_max_output_tokens=getattr(self, "live_max_output_tokens", 2500),
+            startup_receipt_path=self.startup_receipt_path,
+            resume_staging=getattr(self, "resume_staging", None),
         )
-        self.worker_thread.start()
+
+        # Spawn background worker passing immutable config snapshot
+        try:
+            self.worker_thread = threading.Thread(
+                target=self._run_offline_pipeline_worker,
+                args=(doc_path, view_path, output_dir, run_id, mode_str, task_goal, config),
+                daemon=True,
+            )
+            self.worker_thread.start()
+            self._update_startup_receipt(
+                worker_initialization_status="STARTED",
+                startup_outcome="WORKER_STARTED",
+            )
+        except Exception:
+            with self._state_lock:
+                self.is_running = False
+                self.run_state = "FAILED"
+            self._set_controls_running_state(False)
+            self._update_startup_receipt(
+                worker_initialization_status="FAILED",
+                startup_outcome="WORKER_INITIALIZATION_FAILED",
+                failure_category="WORKER_INITIALIZATION_FAILED",
+            )
+            self._append_log("STARTUP_WORKER_INITIALIZATION_FAILED", "ERROR")
 
     def on_cancel_click(self) -> None:
         """Handles Cancel button click: signals cancel to worker under state lock."""
@@ -1149,13 +1366,64 @@ class AgentGUIApp:
         run_id: Optional[str] = None,
         execution_mode: Optional[str] = None,
         task_goal: Optional[str] = None,
+        config: Optional[WorkerRunConfig] = None,
     ) -> None:
         """Executes the preprocessor and offline pipeline in a background thread."""
-        effective_run_id = run_id or getattr(self, "current_run_id", None) or uuid.uuid4().hex
-        effective_mode = execution_mode if execution_mode is not None else self.execution_mode_var.get()
-        effective_task_goal = task_goal or getattr(self, "current_task_goal", None) or (
-            self.task_desc_var.get().strip() if hasattr(self, "task_desc_var") else ""
-        )
+        if config is not None:
+            effective_run_id = config.run_id
+            effective_doc_path = config.doc_path
+            effective_view_path = config.view_path
+            effective_output_dir = config.output_dir
+            effective_mode = config.execution_mode
+            effective_task_goal = config.task_goal
+            effective_allow_live = config.allow_live_dispatch
+            effective_api_key = config.api_key
+            effective_live_timeout = config.live_timeout
+            effective_max_turns = config.max_turns
+            effective_workflow_mode = config.workflow_mode
+            effective_max_output_tokens = getattr(config, "live_max_output_tokens", 2500)
+            startup_receipt_path = config.startup_receipt_path
+        else:
+            effective_run_id = run_id or getattr(self, "current_run_id", None) or uuid.uuid4().hex
+            effective_doc_path = doc_path
+            effective_view_path = view_path
+            effective_output_dir = output_dir
+            if execution_mode is not None:
+                effective_mode = execution_mode
+            elif hasattr(self, "execution_mode_var"):
+                try:
+                    effective_mode = self.execution_mode_var.get()
+                except Exception:
+                    effective_mode = getattr(self, "default_execution_mode", "offline")
+            else:
+                effective_mode = getattr(self, "default_execution_mode", "offline")
+
+            if task_goal is not None:
+                effective_task_goal = task_goal
+            elif getattr(self, "current_task_goal", None) is not None:
+                effective_task_goal = self.current_task_goal
+            elif hasattr(self, "task_desc_var"):
+                try:
+                    effective_task_goal = self.task_desc_var.get().strip()
+                except Exception:
+                    effective_task_goal = ""
+            else:
+                effective_task_goal = ""
+
+            effective_allow_live = getattr(self, "allow_live_dispatch", False)
+            if hasattr(self, "api_key_var"):
+                try:
+                    effective_api_key = self.api_key_var.get().strip()
+                except Exception:
+                    effective_api_key = ""
+            else:
+                effective_api_key = ""
+
+            effective_live_timeout = getattr(self, "live_timeout", 60.0)
+            effective_max_turns = getattr(self, "max_turns", 12)
+            effective_workflow_mode = getattr(self, "workflow_mode", "offline_pipeline")
+            effective_max_output_tokens = getattr(self, "live_max_output_tokens", 2500)
+            startup_receipt_path = getattr(self, "startup_receipt_path", None)
 
         # Distinguish between legacy Space Fractions demonstration and generic task
         is_legacy_demo = (
@@ -1167,15 +1435,32 @@ class AgentGUIApp:
             )
         )
 
-        real_output_dir = os.path.realpath(os.path.abspath(output_dir))
-        os.makedirs(real_output_dir, exist_ok=True)
+        real_output_dir = os.path.realpath(os.path.abspath(effective_output_dir))
+        try:
+            os.makedirs(real_output_dir, exist_ok=True)
+        except OSError:
+            if startup_receipt_path:
+                self._update_startup_receipt(
+                    output_directory_initialization_status="FAILED",
+                    worker_initialization_status="FAILED",
+                    startup_outcome="WORKER_INITIALIZATION_FAILED",
+                    failure_category="OUTPUT_DIRECTORY_INITIALIZATION_FAILED",
+                )
+            self._queue_msg("error", "Output directory initialization failed.", effective_run_id)
+            return
+        if startup_receipt_path:
+            self._update_startup_receipt(
+                output_directory_initialization_status="INITIALIZED",
+                worker_initialization_status="STARTED",
+                startup_outcome="WORKER_STARTED",
+            )
         staging_dir = os.path.join(real_output_dir, f".staging_{effective_run_id}")
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        clean_slug = re.sub(r'[^a-zA-Z0-9]+', '_', effective_task_goal.lower()).strip('_')[:20] or "space_fractions"
         if is_legacy_demo or "space fractions" in effective_task_goal.lower() or "architecture" in effective_task_goal.lower():
             target_run_dir = os.path.join(real_output_dir, f"space_fractions_run_{timestamp_str}_{effective_run_id[:8]}")
         else:
-            clean_slug = re.sub(r'[^a-zA-Z0-9]+', '_', effective_task_goal.lower()).strip('_')[:20] or "task_project"
             target_run_dir = os.path.join(real_output_dir, f"{clean_slug}_run_{timestamp_str}_{effective_run_id[:8]}")
 
         self.last_staging_dir = staging_dir
@@ -1184,7 +1469,7 @@ class AgentGUIApp:
 
         try:
             if effective_mode == "live":
-                if not self.allow_live_dispatch:
+                if not effective_allow_live:
                     with self._state_lock:
                         if self.run_state not in ("COMMITTED", "CANCELLED"):
                             self.run_state = "FAILED"
@@ -1220,6 +1505,86 @@ class AgentGUIApp:
                 return
 
             os.makedirs(staging_dir, exist_ok=False)
+            audit_log_path = os.path.join(staging_dir, "agent_execution.log")
+            try:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(audit_log_path, "w", encoding="utf-8") as lf:
+                    lf.write(f"[{ts}] [INIT] Staging directory initialized for run {effective_run_id[:8]} (Mode: {effective_mode})\n")
+            except Exception:
+                pass
+
+            def _append_worker_log(text: str, tag: str = "INFO") -> None:
+                self._queue_msg("log", (text, tag), effective_run_id)
+                try:
+                    sanitized = redact_secrets(text)
+                    if effective_api_key and len(effective_api_key) > 5:
+                        sanitized = sanitized.replace(effective_api_key, "[REDACTED_API_KEY]")
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(audit_log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"[{ts}] [{tag}] {sanitized}\n")
+                except Exception:
+                    pass
+
+            def _record_audit_milestone(event: str, data: Dict[str, Any]) -> None:
+                try:
+                    sanitized_entry = {k: v for k, v in data.items() if isinstance(v, (str, int, float, bool))}
+                    sanitized_entry["event"] = event
+                    for k, v in list(sanitized_entry.items()):
+                        if isinstance(v, str):
+                            v_clean = redact_secrets(v)
+                            if effective_api_key and len(effective_api_key) > 5:
+                                v_clean = v_clean.replace(effective_api_key, "[REDACTED]")
+                            sanitized_entry[k] = v_clean
+                    json_str = json.dumps(sanitized_entry, sort_keys=True)
+                    _append_worker_log(f"MILESTONE {json_str}", "AUDIT")
+                except Exception:
+                    pass
+
+            is_space_fractions_goal = (
+                "space fraction" in effective_task_goal.lower()
+                or "space_fraction" in effective_task_goal.lower()
+                or "architecture" in effective_task_goal.lower()
+                or "game" in effective_task_goal.lower()
+            )
+
+            def _fail_worker(err_text: str) -> None:
+                sanitized_err = redact_secrets(err_text)
+                if effective_api_key and len(effective_api_key) > 5:
+                    sanitized_err = sanitized_err.replace(effective_api_key, "[REDACTED_API_KEY]")
+                self._queue_msg("error", sanitized_err, effective_run_id)
+                try:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(audit_log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"[{ts}] [ERROR] {sanitized_err}\n")
+                except Exception:
+                    pass
+                try:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    err_copy = os.path.join(real_output_dir, f"error_execution_{effective_run_id[:8]}.log")
+                    if os.path.isfile(audit_log_path):
+                        shutil.copyfile(audit_log_path, err_copy)
+                    else:
+                        with open(err_copy, "w", encoding="utf-8") as ef:
+                            ef.write(f"[{ts}] [ERROR] {sanitized_err}\n")
+                except Exception:
+                    pass
+
+            # Seed staging directory if resuming from a prior staging directory
+            effective_resume = getattr(config, "resume_staging", None) if config else None
+            if effective_resume and os.path.isdir(effective_resume):
+                _append_worker_log(f"Phase 1b: Resuming from prior staging directory: '{effective_resume}'", "INFO")
+                seeded_count = 0
+                for root_dir, _, filenames in os.walk(effective_resume):
+                    for fname in filenames:
+                        if fname in ("agent_execution.log", "error_execution.log", "offline_validation_manifest.json") or fname.startswith("."):
+                            continue
+                        src_f = os.path.join(root_dir, fname)
+                        rel_f = os.path.relpath(src_f, effective_resume)
+                        dst_f = os.path.join(staging_dir, rel_f)
+                        os.makedirs(os.path.dirname(dst_f), exist_ok=True)
+                        shutil.copy2(src_f, dst_f)
+                        seeded_count += 1
+                _append_worker_log(f"Successfully seeded {seeded_count} asset(s) from prior staging directory into isolated staging.", "INFO")
 
             if self.cancel_requested.is_set():
                 with self._state_lock:
@@ -1231,7 +1596,7 @@ class AgentGUIApp:
             if is_legacy_demo:
                 # Step 1: Run Specification Preprocessor (Legacy Space Fractions Demonstration)
                 self._queue_msg("log", ("Phase 2: Ingesting canonical architecture documents (Legacy Demo Mode)...", "INFO"), effective_run_id)
-                spec_result = SpecificationPreprocessor.preprocess(doc_path, view_path)
+                spec_result = SpecificationPreprocessor.preprocess(effective_doc_path, effective_view_path)
                 self._queue_msg("spec_result", spec_result, effective_run_id)
 
                 self._queue_msg(
@@ -1304,23 +1669,23 @@ class AgentGUIApp:
                     summary = self._invoke_synthesis_runner_factory(
                         staging_dir=staging_dir,
                         coordinator=coordinator,
-                        doc_path=doc_path,
-                        view_path=view_path,
+                        doc_path=effective_doc_path,
+                        view_path=effective_view_path,
                         budget_controller=mock_budget,
                         spec_result=spec_result,
                     )
-                elif self.workflow_mode == "mock_synthesis" and self.mock_llm_client is not None:
+                elif effective_workflow_mode == "mock_synthesis" and self.mock_llm_client is not None:
                     summary = self._run_synthesis_driver_workflow(
                         staging_dir=staging_dir,
                         budget_controller=mock_budget,
-                        doc_path=doc_path,
-                        view_path=view_path,
+                        doc_path=effective_doc_path,
+                        view_path=effective_view_path,
                         spec_result=spec_result,
                     )
                 else:
                     summary = coordinator.run_mock_pipeline(
-                        doc_path,
-                        view_path,
+                        effective_doc_path,
+                        effective_view_path,
                         llm_client=effective_llm_client,
                         cancel_event=self.cancel_requested,
                     )
@@ -1335,46 +1700,44 @@ class AgentGUIApp:
 
             else:
                 # Dedicated Generic-Task Path via AgentLoop (Bypasses Space Fractions Preprocessor/Plan)
-                is_live_run = (effective_mode == "live" and self.allow_live_dispatch)
+                is_live_run = (effective_mode == "live" and effective_allow_live)
 
                 if is_live_run:
-                    raw_key = self.api_key_var.get().strip()
+                    raw_key = effective_api_key.strip()
                     if not raw_key:
                         with self._state_lock:
                             if self.run_state not in ("COMMITTING", "COMMITTED", "FAILED"):
                                 self.run_state = "FAILED"
-                        self._queue_msg("error", "Live mode execution requires a valid DeepSeek API key.", effective_run_id)
+                        _fail_worker("Live mode execution requires a valid DeepSeek API key.")
                         return
 
-                    self._queue_msg(
-                        "log",
-                        (f"Phase 2: Initializing LIVE task-driven AgentLoop for goal: '{effective_task_goal}'", "WARNING"),
-                        effective_run_id,
+                    _append_worker_log(
+                        f"Phase 2: Initializing LIVE task-driven AgentLoop for goal: '{effective_task_goal}'",
+                        "WARNING",
                     )
-                    self._queue_msg(
-                        "log",
-                        ("  ✓ Run Mode: Live DeepSeek Agent (deepseek-v4-pro via official HTTPS endpoint)", "INFO"),
-                        effective_run_id,
+                    _append_worker_log(
+                        "  ✓ Run Mode: Live DeepSeek Agent (deepseek-v4-pro via official HTTPS endpoint)",
+                        "INFO",
                     )
-                    self._queue_msg(
-                        "log",
-                        ("  ✓ Safety Enforcement: block_run_command=True (Host code execution prohibited)", "INFO"),
-                        effective_run_id,
+                    _append_worker_log(
+                        "  ✓ Safety Enforcement: block_run_command=True (Host code execution prohibited)",
+                        "INFO",
                     )
 
                     live_client = DeepSeekClient(
                         api_key=raw_key,
                         budget_controller=self.budget_controller,
-                        max_output_tokens=1200,
-                        timeout=getattr(self, "live_timeout", 60.0),
+                        max_output_tokens=min(self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS, max(500, int(effective_max_output_tokens))),
+                        timeout=effective_live_timeout,
+                        audit_callback=_record_audit_milestone,
                     )
                     effective_llm_client = DeepSeekAgentAdapter(
                         client=live_client,
-                        max_output_tokens=1200,
+                        max_output_tokens=min(self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS, max(500, int(effective_max_output_tokens))),
                         cancel_event=self.cancel_requested,
                     )
                     loop_budget_controller = self.budget_controller
-                    loop_max_turns = getattr(self, "max_turns", 12)
+                    loop_max_turns = effective_max_turns
                 else:
                     self._queue_msg(
                         "log",
@@ -1397,6 +1760,24 @@ class AgentGUIApp:
                     loop_budget_controller = mock_budget
                     loop_max_turns = 6
 
+                is_space_fractions_goal = (
+                    "space fraction" in effective_task_goal.lower()
+                    or "architecture" in effective_task_goal.lower()
+                    or "game" in effective_task_goal.lower()
+                )
+
+                # Live Space Fractions generation is bounded by a small number
+                # of paid turns.  Workspace exploration cannot create a required
+                # deliverable, so expose only write_file for this workflow.
+                effective_tools = AgentLoop.TOOLS_SCHEMA
+                if is_live_run and is_space_fractions_goal:
+                    effective_tools = [
+                        tool for tool in AgentLoop.TOOLS_SCHEMA
+                        if tool.get("function", {}).get("name") == "write_file"
+                    ]
+                elif loop_max_turns == 1:
+                    effective_tools = [t for t in AgentLoop.TOOLS_SCHEMA if t.get("function", {}).get("name") == "write_file"]
+
                 agent = AgentLoop(
                     workspace_root=staging_dir,
                     llm_client=effective_llm_client,
@@ -1405,57 +1786,81 @@ class AgentGUIApp:
                     cancel_event=self.cancel_requested,
                     block_run_command=True,
                     session_id=effective_run_id[:8],
+                    tools_schema=effective_tools,
+                    strict_completeness=True,
+                    deliverables_checklist=(
+                        AgentLoop.CANONICAL_SPACE_FRACTIONS_DELIVERABLES
+                        if is_space_fractions_goal
+                        else None
+                    ),
                 )
 
                 spec_result = None
-                if os.path.isfile(doc_path) and os.path.isfile(view_path):
+                if os.path.isfile(effective_doc_path) and os.path.isfile(effective_view_path):
                     try:
-                        spec_result = SpecificationPreprocessor.preprocess(doc_path, view_path)
+                        spec_result = SpecificationPreprocessor.preprocess(effective_doc_path, effective_view_path)
                     except Exception:
                         spec_result = None
 
-                is_space_fractions_goal = (
-                    "space fraction" in effective_task_goal.lower()
-                    or "architecture" in effective_task_goal.lower()
-                    or "game" in effective_task_goal.lower()
-                )
-
                 if is_space_fractions_goal and spec_result is not None:
-                    task_prompt = (
-                        f"Execute the following user task in the designated workspace:\n"
-                        f"Task Goal: {effective_task_goal}\n\n"
-                        f"ARCHITECTURE SPECIFICATION:\n"
-                        f"- System: Space Fractions Grade 6 Interactive Desktop Educational Game.\n"
-                        f"- Kruchten 4+1 Views Ingested: {len(spec_result.view_items)} view items, {len(spec_result.diagrams)} diagrams.\n"
-                        f"- Documented Conflict Directive: Section B mandates a Windows desktop client deliverable. "
-                        f"Implement code ONLY for the local standalone desktop client. Do not require external cloud microservices.\n\n"
-                        f"REQUIRED PROJECT DELIVERABLES (use the write_file tool):\n"
-                        f"1. space_fractions/fraction_math.py:\n"
-                        f"   - Class Fraction(numerator, denominator=1) with methods: __init__, add, subtract, simplify, compare, equals, to_float, __str__, __repr__.\n"
-                        f"   - Class MathQuestionGenerator with method: generate() returning question prompt, options list, correct index, and explanation.\n"
-                        f"2. space_fractions/game_engine.py:\n"
-                        f"   - Enum GameState with values: PLAYING, PAUSED, GAME_OVER.\n"
-                        f"   - Class GameEngine with methods: play(), submit_answer(answer), pause(), resume(), is_game_over(), and viewScore() or view_score().\n"
-                        f"3. space_fractions/question_bank.py:\n"
-                        f"   - Question bank for Grade 6 fractions (addition, subtraction, multiplication, division of fractions with like and unlike denominators).\n"
-                        f"4. space_fractions/ui_screens.py:\n"
-                        f"   - Class FractionVisualizer (Tkinter Canvas drawing fraction pie charts or rectangular bars).\n"
-                        f"   - Class HUDFrame (displays current score, remaining lives, and question progress).\n"
-                        f"5. space_fractions/main.py:\n"
-                        f"   - Class SpaceFractionsApp (complete Tkinter desktop application integrating FractionVisualizer, HUDFrame, and GameEngine with start, play, pause, and game-over screens).\n"
-                        f"   - Function main() as the desktop application entry point.\n"
-                        f"6. tests/test_fraction_game.py:\n"
-                        f"   - Comprehensive unit test functions (starting with test_) verifying Fraction arithmetic, question generation, and GameEngine state transitions.\n"
-                        f"7. requirements.txt:\n"
-                        f"   - Dependency manifest (stdlib only, zero external packages needed).\n"
-                        f"8. README.md:\n"
-                        f"   - Overview, architecture traceability, and instructions for running the game.\n\n"
-                        f"INSTRUCTIONS:\n"
-                        f"- Use the write_file tool to generate each file completely and cleanly.\n"
-                        f"- You may write multiple files across turns.\n"
-                        f"- Keep all relative paths inside the workspace.\n"
-                        f"- Once all deliverables are written, provide a brief summary of the completed project."
-                    )
+                    if loop_max_turns == 1:
+                        task_prompt = (
+                            f"Execute the following user task in the designated workspace:\n"
+                            f"Task Goal: {effective_task_goal}\n\n"
+                            f"ARCHITECTURE SPECIFICATION:\n"
+                            f"- System: Space Fractions Grade 6 Interactive Desktop Educational Game.\n"
+                            f"- Conflict Directive: Standalone local Windows desktop client only.\n\n"
+                            f"REQUIRED CORE MODULE DELIVERABLES (use the write_file tool):\n"
+                            f"1. space_fractions/fraction_math.py:\n"
+                            f"   - Class Fraction(numerator, denominator=1) with methods: __init__, add, subtract, simplify, compare, equals, to_float, __str__, __repr__.\n"
+                            f"   - Class MathQuestionGenerator with method: generate() returning prompt, options, correct_idx, explanation.\n"
+                            f"2. space_fractions/game_engine.py:\n"
+                            f"   - Enum GameState with values: PLAYING, PAUSED, GAME_OVER.\n"
+                            f"   - Class GameEngine with methods: play(), submit_answer(answer), pause(), resume(), is_game_over(), view_score(), viewScore().\n"
+                            f"3. tests/test_fraction_game.py:\n"
+                            f"   - Unit tests verifying Fraction arithmetic and GameEngine state transitions.\n\n"
+                            f"CRITICAL SINGLE-TURN INSTRUCTIONS:\n"
+                            f"- You have EXACTLY ONE completion turn. Generate all three files in this single response using the write_file tool.\n"
+                            f"- Alternatively, output each file inside a markdown code block starting with ```python:path/to/file.py.\n"
+                            f"- Keep all code clean, self-contained, and syntactically valid Python 3."
+                        )
+                    else:
+                        task_prompt = (
+                            f"Execute the following user task in the designated workspace:\n"
+                            f"Task Goal: {effective_task_goal}\n\n"
+                            f"ARCHITECTURE SPECIFICATION:\n"
+                            f"- System: Space Fractions Grade 6 Interactive Desktop Educational Game.\n"
+                            f"- Kruchten 4+1 Views Ingested: {len(spec_result.view_items)} view items, {len(spec_result.diagrams)} diagrams.\n"
+                            f"- Documented Conflict Directive: Section B mandates a Windows desktop client deliverable. "
+                            f"Implement code ONLY for the local standalone desktop client. Do not require external cloud microservices.\n\n"
+                            f"REQUIRED PROJECT DELIVERABLES (use the write_file tool):\n"
+                            f"1. space_fractions/fraction_math.py:\n"
+                            f"   - Class Fraction(numerator, denominator=1) with methods: __init__, add, subtract, simplify, compare, equals, to_float, __str__, __repr__.\n"
+                            f"   - Class MathQuestionGenerator with method: generate() returning question prompt, options list, correct index, and explanation.\n"
+                            f"2. space_fractions/game_engine.py:\n"
+                            f"   - Enum GameState with values: PLAYING, PAUSED, GAME_OVER.\n"
+                            f"   - Class GameEngine with methods: play(), submit_answer(answer), pause(), resume(), is_game_over(), and viewScore() or view_score().\n"
+                            f"3. space_fractions/question_bank.py:\n"
+                            f"   - Question bank for Grade 6 fractions (addition, subtraction, multiplication, division of fractions with like and unlike denominators).\n"
+                            f"4. space_fractions/ui_screens.py:\n"
+                            f"   - Class FractionVisualizer (Tkinter Canvas drawing fraction pie charts or rectangular bars).\n"
+                            f"   - Class HUDFrame (displays current score, remaining lives, and question progress).\n"
+                            f"5. space_fractions/main.py:\n"
+                            f"   - Class SpaceFractionsApp (complete Tkinter desktop application integrating FractionVisualizer, HUDFrame, and GameEngine with start, play, pause, and game-over screens).\n"
+                            f"   - Function main() as the desktop application entry point.\n"
+                            f"6. tests/test_fraction_game.py:\n"
+                            f"   - Comprehensive unit test functions (starting with test_) verifying Fraction arithmetic, question generation, and GameEngine state transitions.\n"
+                            f"7. requirements.txt:\n"
+                            f"   - Dependency manifest (stdlib only, zero external packages needed).\n"
+                            f"8. README.md:\n"
+                            f"   - Overview, architecture traceability, and instructions for running the game.\n\n"
+                            f"INSTRUCTIONS:\n"
+                            f"- Use the write_file tool to generate each required deliverable.\n"
+                            f"- Focus on generating ONE deliverable at a time per turn, starting with '{AgentLoop.CANONICAL_SPACE_FRACTIONS_DELIVERABLES[0]}'.\n"
+                            f"- Keep all relative paths inside the workspace.\n"
+                            f"- Never output context compaction placeholders such as '[content omitted after local write]'; you must always provide complete, functional source code for each file.\n"
+                            f"- Once all deliverables are written, provide a brief summary of the completed project."
+                        )
                 else:
                     task_prompt = (
                         f"Execute the following user task in the designated workspace:\n"
@@ -1465,8 +1870,40 @@ class AgentGUIApp:
                         f"- Ensure all relative file paths stay inside the designated workspace.\n"
                     )
 
-                self._queue_msg("log", ("Phase 3: Dispatching task goal to AgentLoop with tool calling...", "INFO"), effective_run_id)
+                _append_worker_log("Phase 3: Dispatching task goal to AgentLoop with tool calling...", "INFO")
                 loop_result = agent.run(task_prompt)
+
+                # Log transcript diagnostics to audit log
+                total_tool_calls = 0
+                accepted_tool_calls = 0
+                rejected_tool_calls = 0
+                for t_entry in loop_result.transcript:
+                    if t_entry.role == "assistant_tool_call":
+                        tool_names = sorted({str(c.get("name", "unknown")) for c in t_entry.tool_calls})
+                        _append_worker_log(
+                            f"TOOL_CALLS turn={t_entry.turn_index} count={len(t_entry.tool_calls)} "
+                            f"types={','.join(tool_names)}",
+                            "INFO",
+                        )
+                    elif t_entry.role == "tool_result":
+                        total_tool_calls += 1
+                        is_err = "Error" in (t_entry.tool_result or "") or "SecurityError" in (t_entry.tool_result or "")
+                        if is_err:
+                            rejected_tool_calls += 1
+                        else:
+                            accepted_tool_calls += 1
+                        outcome = "rejected" if is_err else "accepted"
+                        _append_worker_log(
+                            f"TOOL_RESULT turn={t_entry.turn_index} tool={t_entry.tool_name} outcome={outcome}",
+                            "INFO",
+                        )
+
+                _record_audit_milestone("TOOL_DISPATCH_SUMMARY", {
+                    "event": "TOOL_DISPATCH_SUMMARY",
+                    "total_calls": total_tool_calls,
+                    "accepted_calls": accepted_tool_calls,
+                    "rejected_calls": rejected_tool_calls,
+                })
 
                 if self.cancel_requested.is_set() or loop_result.status == LoopTerminationStatus.CANCELLED:
                     with self._state_lock:
@@ -1475,26 +1912,34 @@ class AgentGUIApp:
                     self._queue_msg("cancelled", "Task execution cancelled by user signal.", effective_run_id)
                     return
 
-                if loop_result.status != LoopTerminationStatus.COMPLETED:
-                    with self._state_lock:
-                        if self.run_state not in ("COMMITTING", "COMMITTED"):
-                            self.run_state = "FAILED"
-                    if loop_result.status == LoopTerminationStatus.MAX_TURNS_REACHED:
-                        err_msg = (
-                            f"Incomplete task execution: AgentLoop reached maximum turn limit ({loop_max_turns}) "
-                            f"without receiving a model completion signal."
-                        )
-                    else:
-                        err_msg = loop_result.error_message or f"AgentLoop terminated with status {loop_result.status.value}"
-                    self._queue_msg("error", f"Task execution failed: {err_msg}", effective_run_id)
-                    return
-
-                # Collect written files
+                # Collect written files (excluding internal execution log)
                 gen_files = []
                 for root_dir, _, filenames in os.walk(staging_dir):
                     for fname in filenames:
+                        if fname == "agent_execution.log":
+                            continue
                         full_p = os.path.realpath(os.path.join(root_dir, fname))
                         gen_files.append(full_p)
+
+                if loop_result.status != LoopTerminationStatus.COMPLETED:
+                    if loop_result.status == LoopTerminationStatus.MAX_TURNS_REACHED and len(gen_files) > 0:
+                        _append_worker_log(
+                            f"Turn limit ({loop_max_turns}) reached with {len(gen_files)} staged deliverable(s); proceeding to static validation...",
+                            "INFO",
+                        )
+                    else:
+                        with self._state_lock:
+                            if self.run_state not in ("COMMITTING", "COMMITTED"):
+                                self.run_state = "FAILED"
+                        if loop_result.status == LoopTerminationStatus.MAX_TURNS_REACHED:
+                            err_msg = (
+                                f"Incomplete task execution: AgentLoop reached maximum turn limit ({loop_max_turns}) "
+                                f"without generating deliverables or receiving a model completion signal."
+                            )
+                        else:
+                            err_msg = loop_result.error_message or f"AgentLoop terminated with status {loop_result.status.value}"
+                        _fail_worker(f"Task execution failed: {err_msg}")
+                        return
 
                 if is_live_run:
                     sec_notices = [
@@ -1552,27 +1997,39 @@ class AgentGUIApp:
             # Step 4b: Static Acceptance Contract Validation via ProjectValidator
             self._queue_msg("log", ("Phase 4b: Validating generated project against static acceptance contract...", "INFO"), effective_run_id)
             if is_legacy_demo:
-                require_full = (self.workflow_mode == "offline_pipeline")
+                require_full = (effective_workflow_mode == "offline_pipeline")
                 validation_result = ProjectValidator.validate_project(
-                    staging_dir, require_full_game=require_full
+                    staging_dir, require_full_game=require_full, require_manifest=False
+                )
+            elif is_space_fractions_goal:
+                # Space Fractions tasks MUST strictly satisfy the authoritative full game acceptance contract.
+                # Generic validation fallback is strictly prohibited for Space Fractions.
+                validation_result = ProjectValidator.validate_project(
+                    staging_dir, require_full_game=True, require_manifest=False
                 )
             else:
-                val_full = ProjectValidator.validate_project(staging_dir, require_full_game=True)
-                if val_full.success:
-                    validation_result = val_full
-                else:
-                    val_gen = ProjectValidator.validate_generic_project(staging_dir)
-                    if val_gen.success:
-                        validation_result = val_gen
-                    else:
-                        validation_result = val_full
+                validation_result = ProjectValidator.validate_generic_project(staging_dir)
+
+            val_mode_name = "SPACE_FRACTIONS" if (is_legacy_demo or is_space_fractions_goal) else "GENERIC"
+            _record_audit_milestone("VALIDATION_RESULT", {
+                "event": "VALIDATION_RESULT",
+                "mode": val_mode_name,
+                "success": validation_result.success,
+                "verified_files_count": len(validation_result.verified_files),
+                "error_count": len(validation_result.errors),
+            })
 
             if not validation_result.success:
                 with self._state_lock:
                     if self.run_state not in ("COMMITTED", "CANCELLED"):
                         self.run_state = "FAILED"
                 err_msg = "; ".join(validation_result.errors) if validation_result.errors else "Static contract validation failed."
-                self._queue_msg("error", f"Static acceptance validation failed in staging: {err_msg}", effective_run_id)
+                _record_audit_milestone("PROMOTION_OUTCOME", {
+                    "event": "PROMOTION_OUTCOME",
+                    "promoted": False,
+                    "destination_dir": "",
+                })
+                _fail_worker(f"Static acceptance validation failed in staging: {err_msg}")
                 return
 
             for iface in validation_result.verified_interfaces:
@@ -1632,6 +2089,21 @@ class AgentGUIApp:
             if manifest_path not in summary.generated_files:
                 summary.generated_files.append(manifest_path)
 
+            # Step 5b: Validate Safe Manifest Consistency Before Promotion
+            m_ok, m_errs, _ = ProjectValidator.validate_manifest(manifest_path, staging_dir)
+            if not m_ok:
+                with self._state_lock:
+                    if self.run_state not in ("COMMITTED", "CANCELLED"):
+                        self.run_state = "FAILED"
+                err_msg = "; ".join(m_errs) if m_errs else "Manifest consistency validation failed."
+                _record_audit_milestone("PROMOTION_OUTCOME", {
+                    "event": "PROMOTION_OUTCOME",
+                    "promoted": False,
+                    "destination_dir": "",
+                })
+                _fail_worker(f"Manifest validation failed in staging: {err_msg}")
+                return
+
             # Optional pre-commit hook for deterministic concurrency regression tests
             if getattr(self, "_pre_commit_hook", None):
                 self._pre_commit_hook()
@@ -1643,6 +2115,11 @@ class AgentGUIApp:
 
                 if self.cancel_requested.is_set() or self.run_state == "CANCELLED":
                     self.run_state = "CANCELLED"
+                    _record_audit_milestone("PROMOTION_OUTCOME", {
+                        "event": "PROMOTION_OUTCOME",
+                        "promoted": False,
+                        "destination_dir": "",
+                    })
                     self._queue_msg("cancelled", "Validation cancelled prior to commit boundary.", effective_run_id)
                     return
 
@@ -1658,8 +2135,18 @@ class AgentGUIApp:
                     os.rename(staging_dir, target_run_dir)
                     self.run_state = "COMMITTED"
                     self.last_run_dir = target_run_dir
+                    _record_audit_milestone("PROMOTION_OUTCOME", {
+                        "event": "PROMOTION_OUTCOME",
+                        "promoted": True,
+                        "destination_dir": os.path.basename(target_run_dir),
+                    })
                 except OSError as prom_err:
                     self.run_state = "FAILED"
+                    _record_audit_milestone("PROMOTION_OUTCOME", {
+                        "event": "PROMOTION_OUTCOME",
+                        "promoted": False,
+                        "destination_dir": "",
+                    })
                     self._queue_msg("error", f"Directory promotion failed: {prom_err}", effective_run_id)
                     return
 
@@ -1706,11 +2193,18 @@ class AgentGUIApp:
                     (f"  ✓ Offline pipeline completed successfully! Promoted directory: {os.path.basename(target_run_dir)}", "SUCCESS"),
                     effective_run_id,
                 )
-                self._queue_msg(
-                    "log",
-                    ("  ✓ Verified spend unchanged at $0.000186 (Zero live DeepSeek tokens billed).", "SUCCESS"),
-                    effective_run_id,
-                )
+                if getattr(self, "has_authoritative_history", False):
+                    self._queue_msg(
+                        "log",
+                        (f"  ✓ Offline run completed; no live DeepSeek API call was made by this run. Authoritative historical spend: ${self.budget_controller.cumulative_spend:.6f} USD.", "SUCCESS"),
+                        effective_run_id,
+                    )
+                else:
+                    self._queue_msg(
+                        "log",
+                        ("  ✓ Offline run completed; no live DeepSeek API call was made by this run. Historical provider spend remains UNRECONCILED.", "SUCCESS"),
+                        effective_run_id,
+                    )
                 self._queue_msg(
                     "completed",
                     f"Offline validation run completed successfully in {os.path.basename(target_run_dir)}",
@@ -1731,7 +2225,17 @@ class AgentGUIApp:
             with self._state_lock:
                 if self.run_state not in ("COMMITTED", "CANCELLED"):
                     self.run_state = "FAILED"
-            self._queue_msg("error", f"Unexpected Pipeline Error: {err}", effective_run_id)
+            sanitized_err = redact_secrets(str(err))
+            if 'effective_api_key' in locals() and effective_api_key and len(effective_api_key) > 5:
+                sanitized_err = sanitized_err.replace(effective_api_key, "[REDACTED_API_KEY]")
+            self._queue_msg("error", f"Unexpected Pipeline Error: {sanitized_err}", effective_run_id)
+            try:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                err_copy = os.path.join(real_output_dir, f"error_execution_{effective_run_id[:8]}.log")
+                with open(err_copy, "w", encoding="utf-8") as ef:
+                    ef.write(f"[{ts}] [UNEXPECTED_PIPELINE_ERROR] {sanitized_err}\n")
+            except Exception:
+                pass
 
     def _invoke_synthesis_runner_factory(
         self,
@@ -2066,8 +2570,12 @@ class AgentGUIApp:
                     spend_text = "INVALID"
                 else:
                     spend_val = val
-                    verified_valid = True
-                    spend_text = f"${val:.6f}"
+                    if getattr(self, "has_authoritative_history", False):
+                        verified_valid = True
+                        spend_text = f"${val:.6f}"
+                    else:
+                        verified_valid = False
+                        spend_text = "UNRECONCILED"
         except (TypeError, ValueError, AttributeError):
             spend_text = "INVALID"
 
@@ -2208,6 +2716,24 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=False,
         help="Suppress modal dialog boxes for unattended/headless execution.",
     )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=2500,
+        help="Maximum output tokens for live API requests (default: 2500, max: 4096).",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        default=False,
+        help="Run bounded offline GUI and Tkinter runtime smoke tests and exit.",
+    )
+    parser.add_argument(
+        "--resume-staging",
+        type=str,
+        default=None,
+        help="Optional path to an existing staging directory to seed/resume verified deliverables from.",
+    )
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -2216,6 +2742,18 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     if args.timeout <= 0:
         raise ValueError("--timeout must be a positive number.")
+
+    if args.max_output_tokens <= 0 or args.max_output_tokens > 4096:
+        raise ValueError("--max-output-tokens must be an integer between 1 and 4096.")
+
+    if args.resume_staging is not None:
+        raw_resume = args.resume_staging.strip()
+        if not raw_resume:
+            raise ValueError("--resume-staging path cannot be empty.")
+        if "\0" in raw_resume:
+            raise PathSecurityError("Null bytes detected in resume-staging path.")
+        if not os.path.isdir(raw_resume):
+            raise FileNotFoundError(f"--resume-staging directory does not exist: '{raw_resume}'")
 
     if args.mode == "live" and not args.allow_live_dispatch:
         parser.error("Mode 'live' is prohibited without explicit --allow-live-dispatch authorization.")
@@ -2252,6 +2790,82 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+def _smoke_write(message: str, *, error: bool = False) -> None:
+    """Write optional smoke diagnostics without requiring a console subsystem."""
+    stream = sys.stderr if error else sys.stdout
+    if stream is None:
+        return
+    try:
+        stream.write(message)
+        stream.flush()
+    except (AttributeError, OSError):
+        return
+
+
+def run_offline_smoke_test(args: argparse.Namespace) -> None:
+    """Run bounded offline smoke test against Tkinter runtime and GUI controls."""
+    _smoke_write("[SMOKE-TEST] Starting bounded offline runtime verification...\n")
+
+    # Stage 1: import tkinter
+    try:
+        import tkinter as test_tk
+        _smoke_write("[SMOKE-TEST] Stage 1/5: import tkinter succeeded.\n")
+    except Exception as err:
+        _smoke_write(f"[SMOKE-TEST] Stage 1/5 FAILED: import tkinter failed: {err}\n", error=True)
+        sys.exit(1)
+
+    # Stage 2: tkinter.Tcl()
+    try:
+        tcl = test_tk.Tcl()
+        patchlevel = tcl.eval("info patchlevel")
+        _smoke_write(f"[SMOKE-TEST] Stage 2/5: tkinter.Tcl() initialized (patchlevel: {patchlevel}).\n")
+    except Exception as err:
+        _smoke_write(f"[SMOKE-TEST] Stage 2/5 FAILED: tkinter.Tcl() failed: {err}\n", error=True)
+        sys.exit(2)
+
+    # Stage 3: tkinter.Tk()
+    try:
+        root = test_tk.Tk()
+        root.withdraw()
+        _smoke_write("[SMOKE-TEST] Stage 3/5: tkinter.Tk() initialized successfully.\n")
+    except Exception as err:
+        _smoke_write(f"[SMOKE-TEST] Stage 3/5 FAILED: tkinter.Tk() failed: {err}\n", error=True)
+        sys.exit(3)
+
+    # Stage 4: Default task and output-directory controls initialize
+    try:
+        app = AgentGUIApp(
+            root,
+            suppress_messagebox=True,
+            default_task=args.task,
+            default_output_dir=args.output_dir,
+        )
+        assert hasattr(app, "task_entry") and app.task_entry is not None, "task_entry missing"
+        assert hasattr(app, "output_entry") and app.output_entry is not None, "output_entry missing"
+        assert hasattr(app, "btn_start") and app.btn_start is not None, "btn_start missing"
+        assert hasattr(app, "btn_cancel") and app.btn_cancel is not None, "btn_cancel missing"
+        assert app.task_entry.get().strip() != "", "Default task prompt is empty"
+        assert app.output_entry.get().strip() != "", "Default output directory is empty"
+        _smoke_write("[SMOKE-TEST] Stage 4/5: Default task and output-directory controls initialized successfully.\n")
+    except Exception as err:
+        _smoke_write(f"[SMOKE-TEST] Stage 4/5 FAILED: GUI controls initialization failed: {err}\n", error=True)
+        root.destroy()
+        sys.exit(4)
+
+    # Stage 5: GUI enters event loop and closes cleanly
+    try:
+        root.update()
+        root.after(100, root.destroy)
+        root.mainloop()
+        _smoke_write("[SMOKE-TEST] Stage 5/5: GUI entered event loop and closed cleanly.\n")
+    except Exception as err:
+        _smoke_write(f"[SMOKE-TEST] Stage 5/5 FAILED: GUI event loop error: {err}\n", error=True)
+        sys.exit(5)
+
+    _smoke_write("[SMOKE-TEST] ALL 5 SMOKE TEST STAGES PASSED CLEANLY.\n")
+    sys.exit(0)
+
+
 def main() -> None:
     try:
         args = parse_cli_args()
@@ -2260,6 +2874,10 @@ def main() -> None:
         sys.exit(2)
     except SystemExit as err:
         sys.exit(err.code)
+
+    if args.smoke_test:
+        run_offline_smoke_test(args)
+        return
 
     root = tk.Tk()
     suppress_mb = args.suppress_messagebox or args.auto_run
@@ -2275,6 +2893,8 @@ def main() -> None:
         default_task=args.task,
         max_turns=args.max_turns,
         live_timeout=args.timeout,
+        live_max_output_tokens=args.max_output_tokens,
+        resume_staging=args.resume_staging,
     )
     root.mainloop()
 

@@ -7,6 +7,7 @@ and deterministic termination.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import threading
@@ -26,6 +27,26 @@ class LoopTerminationStatus(str, Enum):
     MALFORMED_RESPONSE_ABORTED = "MALFORMED_RESPONSE_ABORTED"
     CANCELLED = "CANCELLED"
     REFUSAL_ABORTED = "REFUSAL_ABORTED"
+    SAFETY_ABORTED = "SAFETY_ABORTED"
+    INCOMPLETE_DELIVERABLES_ABORTED = "INCOMPLETE_DELIVERABLES_ABORTED"
+    REPAIR_EXHAUSTED_ABORTED = "REPAIR_EXHAUSTED_ABORTED"
+
+
+class DeliverableStatus(str, Enum):
+    PENDING = "PENDING"
+    GENERATING = "GENERATING"
+    VALIDATED = "VALIDATED"
+    FAILED = "FAILED"
+    REPAIR_REQUIRED = "REPAIR_REQUIRED"
+
+
+@dataclass
+class DeliverableManifestEntry:
+    path: str
+    status: DeliverableStatus = DeliverableStatus.PENDING
+    attempts: int = 0
+    failure_reasons: List[str] = field(default_factory=list)
+    last_verified_size: int = 0
 
 
 @dataclass
@@ -78,11 +99,26 @@ class DeepSeekAgentAdapter:
         self.max_output_tokens = effective_tokens
         self.cancel_event = cancel_event
 
+    def prepare_request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
+        """Exposes prepared request creation for AgentLoop budget reservation parity."""
+        if hasattr(self.client, "prepare_request"):
+            return self.client.prepare_request(
+                messages=messages,
+                tools=tools,
+                max_tokens=self.max_output_tokens,
+            )
+        return None
+
     def chat_completion(
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         reservation_id: Optional[str] = None,
+        prepared_request: Optional[Any] = None,
     ) -> ModelTurnResponse:
         # Check cancellation before dispatch
         if self.cancel_event and self.cancel_event.is_set():
@@ -95,15 +131,22 @@ class DeepSeekAgentAdapter:
                 cancellation_outcome="cancelled_before_transmission",
             )
 
+        kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "tools": tools,
+            "max_tokens": self.max_output_tokens,
+            "cancel_event": self.cancel_event,
+            "skip_budget_reservation": True,
+            "reservation_id": reservation_id,
+        }
+        if prepared_request is not None:
+            import inspect
+            sig = inspect.signature(self.client.send_chat_completion)
+            if "prepared_request" in sig.parameters:
+                kwargs["prepared_request"] = prepared_request
+
         # Call client with skip_budget_reservation=True (AgentLoop manages reservation)
-        response = self.client.send_chat_completion(
-            messages=messages,
-            tools=tools,
-            max_tokens=self.max_output_tokens,
-            cancel_event=self.cancel_event,
-            skip_budget_reservation=True,
-            reservation_id=reservation_id,
-        )
+        response = self.client.send_chat_completion(**kwargs)
 
         return self.adapt_response(response)
 
@@ -347,6 +390,17 @@ class AgentLoop:
         },
     ]
 
+    CANONICAL_SPACE_FRACTIONS_DELIVERABLES: List[str] = [
+        "space_fractions/fraction_math.py",
+        "space_fractions/game_engine.py",
+        "space_fractions/question_bank.py",
+        "space_fractions/ui_screens.py",
+        "space_fractions/main.py",
+        "tests/test_fraction_game.py",
+        "requirements.txt",
+        "README.md",
+    ]
+
     MAX_FILE_WRITE_BYTES = 500_000  # 500 KB limit per file write
 
     def __init__(
@@ -362,6 +416,10 @@ class AgentLoop:
         tools_schema: Optional[List[Dict[str, Any]]] = None,
         authorized_target: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
+        deliverables_checklist: Optional[List[str]] = None,
+        max_retries_per_deliverable: int = 2,
+        max_repair_attempts: int = 2,
+        strict_completeness: bool = False,
     ) -> None:
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
         self.llm_client = llm_client
@@ -373,6 +431,18 @@ class AgentLoop:
         self.session_id = session_id
         self.tools_schema = tools_schema if tools_schema is not None else self.TOOLS_SCHEMA
         self.authorized_target = authorized_target
+        self.deliverables_checklist = list(deliverables_checklist) if deliverables_checklist is not None else None
+        self.max_retries_per_deliverable = max_retries_per_deliverable
+        self.max_repair_attempts = max_repair_attempts
+        self.strict_completeness = strict_completeness
+
+        self.deliverable_retries: Dict[str, int] = {}
+        self._repair_attempts: int = 0
+        self.deliverables_manifest: Dict[str, DeliverableManifestEntry] = {}
+        if self.deliverables_checklist:
+            for p in self.deliverables_checklist:
+                self.deliverables_manifest[p] = DeliverableManifestEntry(path=p)
+            self.update_deliverables_manifest()
 
         client_tokens = getattr(llm_client, "max_output_tokens", None)
         if max_output_tokens is not None:
@@ -392,12 +462,148 @@ class AgentLoop:
         self._consecutive_failures = 0
         self._last_failing_signature = ""
 
+    def validate_deliverable(self, rel_path: str) -> Tuple[bool, List[str]]:
+        """Exhaustively validates deliverable existence, non-emptiness, syntax, and interfaces."""
+        norm_path = os.path.normpath(rel_path).replace("\\", "/")
+        full_path = os.path.join(self.workspace_root, norm_path)
+        if not os.path.isfile(full_path):
+            return False, [f"File '{norm_path}' does not exist on disk."]
+        try:
+            size = os.path.getsize(full_path)
+            if size == 0:
+                return False, [f"File '{norm_path}' is empty (0 bytes)."]
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            # Must not contain compaction placeholder or failure marker
+            if (
+                self.COMPACTED_CONTENT_MARKER in content
+                or "[content omitted after local write]" in content
+                or "[write failed:" in content
+            ):
+                return False, [f"File '{norm_path}' contains compaction placeholder or failure marker."]
+
+            if norm_path.endswith(".py"):
+                try:
+                    tree = ast.parse(content, filename=norm_path)
+                except SyntaxError as se:
+                    return False, [f"Syntax error in '{norm_path}': {se}"]
+
+                # Verify non-trivial AST body
+                if not tree.body:
+                    return False, [f"File '{norm_path}' contains zero code statements (comment/empty stub only)."]
+
+            elif norm_path == "README.md":
+                if size == 0:
+                    return False, [f"README.md is empty (0 bytes)."]
+
+            return True, []
+        except Exception as err:
+            return False, [f"Unexpected error validating '{norm_path}': {err}"]
+
+    def is_deliverable_complete(self, rel_path: str) -> bool:
+        """Determines if a required deliverable is complete and valid on disk."""
+        valid, _ = self.validate_deliverable(rel_path)
+        return valid
+
+    def update_deliverables_manifest(self) -> None:
+        """Updates manifest state for all checklist deliverables from current disk state."""
+        if not self.deliverables_checklist:
+            return
+        for rel_path in self.deliverables_checklist:
+            entry = self.deliverables_manifest.setdefault(rel_path, DeliverableManifestEntry(path=rel_path))
+            full_path = os.path.join(self.workspace_root, os.path.normpath(rel_path))
+            if os.path.isfile(full_path):
+                entry.last_verified_size = os.path.getsize(full_path)
+                valid, reasons = self.validate_deliverable(rel_path)
+                if valid:
+                    entry.status = DeliverableStatus.VALIDATED
+                    entry.failure_reasons = []
+                else:
+                    entry.status = DeliverableStatus.FAILED
+                    entry.failure_reasons = reasons
+            else:
+                entry.last_verified_size = 0
+                if entry.attempts > 0:
+                    entry.status = DeliverableStatus.FAILED
+                    entry.failure_reasons = ["File not found on disk after write attempt."]
+                else:
+                    entry.status = DeliverableStatus.PENDING
+                    entry.failure_reasons = []
+
+    def get_manifest_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Returns structured summary of deliverables manifest."""
+        self.update_deliverables_manifest()
+        return {
+            p: {
+                "status": entry.status.value,
+                "attempts": entry.attempts,
+                "size_bytes": entry.last_verified_size,
+                "failure_reasons": list(entry.failure_reasons),
+            }
+            for p, entry in self.deliverables_manifest.items()
+        }
+
+    def get_deliverables_status(self) -> Tuple[List[str], List[str], Optional[str]]:
+        """Returns (completed_list, missing_list, next_target_rel_path) based on validated disk state."""
+        if not self.deliverables_checklist:
+            return [], [], None
+        self.update_deliverables_manifest()
+        completed = [p for p in self.deliverables_checklist if self.deliverables_manifest[p].status == DeliverableStatus.VALIDATED]
+        missing = [p for p in self.deliverables_checklist if p not in completed]
+        next_target = missing[0] if missing else None
+        return completed, missing, next_target
+
+    @classmethod
+    def get_deliverable_hint(cls, target: str) -> str:
+        """Returns concise targeted instructions to prevent model over-generation and output truncation."""
+        if target == "space_fractions/main.py":
+            return (
+                "Keep space_fractions/main.py minimal and focused (under 150 lines): define class SpaceFractionsApp(root) and def main(). "
+                "Import FractionVisualizer and HUDFrame from space_fractions.ui_screens, and GameEngine and GameState from space_fractions.game_engine. "
+                "Connect start, play, pause, and game-over screens without re-implementing existing widgets or math logic."
+            )
+        if target == "tests/test_fraction_game.py":
+            return (
+                "Write self-contained unit tests: test_ functions verifying Fraction arithmetic (add, subtract, simplify, compare, equals), "
+                "MathQuestionGenerator, and GameEngine state transitions (play, pause, submit_answer, game_over)."
+            )
+        if target == "requirements.txt":
+            return "Python standard library only. Write a comment header noting no third-party dependencies are required."
+        if target == "README.md":
+            return "Write README.md with project overview, Grade 6 educational objectives, Kruchten 4+1 architecture traceability, and launch instructions."
+        return ""
+
     def run(self, initial_prompt: str, session_id: Optional[str] = None) -> AgentLoopResult:
         """Runs the multi-turn agent loop until completion or safety boundary is reached."""
         effective_session_id = session_id or self.session_id
+
+        # Auto-configure checklist if matching Space Fractions task
+        if self.deliverables_checklist is None:
+            prompt_lower = initial_prompt.lower()
+            if "space fraction" in prompt_lower or "grade 6" in prompt_lower or "fraction_math" in prompt_lower:
+                self.deliverables_checklist = list(self.CANONICAL_SPACE_FRACTIONS_DELIVERABLES)
+
+        user_content = initial_prompt
+        if self.deliverables_checklist:
+            completed, missing, next_target = self.get_deliverables_status()
+            if missing and next_target:
+                hint = self.get_deliverable_hint(next_target)
+                hint_str = f" {hint}" if hint else ""
+                user_content += (
+                    f"\n\nCHECKLIST: {len(completed)}/{len(self.deliverables_checklist)} completed. "
+                    f"DIRECTIVE FOR TURN 1: Write ONLY '{next_target}' in this turn using write_file.{hint_str}"
+                )
+
+        system_instruction = (
+            "You are a disciplined coding agent. Write clean code and verify with tests.\n"
+            "Note: In previous turns, file contents in completed write_file calls are compacted "
+            "in conversation history as '[content omitted after local write]' to save context. "
+            "Never output this placeholder yourself; always provide full, complete file content."
+        )
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": "You are a disciplined coding agent. Write clean code and verify with tests."},
-            {"role": "user", "content": initial_prompt},
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_content},
         ]
         self.transcript.append(TranscriptEntry(turn_index=0, role="user", content=initial_prompt))
 
@@ -419,22 +625,40 @@ class AgentLoop:
                 reservation_id = f"turn-{turn_index}"
 
             # 1. Budget reservation gate
-            prompt_context = json.dumps(messages)
-            if self.max_output_tokens > self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS:
+            prepared_request = None
+            if hasattr(self.llm_client, "prepare_request"):
+                try:
+                    prepared_request = self.llm_client.prepare_request(messages, self.tools_schema)
+                except Exception as prep_err:
+                    return AgentLoopResult(
+                        status=LoopTerminationStatus.MALFORMED_RESPONSE_ABORTED,
+                        total_turns=turn_index - 1,
+                        transcript=self.transcript,
+                        error_message=f"Failed to prepare request: {prep_err}",
+                    )
+
+            if prepared_request is not None:
+                reserve_payload = prepared_request.payload
+                effective_max_tokens = prepared_request.max_output_tokens
+            else:
+                reserve_payload = json.dumps(messages)
+                effective_max_tokens = self.max_output_tokens
+
+            if effective_max_tokens > self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS:
                 return AgentLoopResult(
                     status=LoopTerminationStatus.BUDGET_EXCEEDED,
                     total_turns=turn_index - 1,
                     transcript=self.transcript,
                     error_message=(
-                        f"Output token limit mismatch: AgentLoop output tokens ({self.max_output_tokens}) "
+                        f"Output token limit mismatch: AgentLoop output tokens ({effective_max_tokens}) "
                         f"exceeds BudgetController limit ({self.budget_controller.MAX_PERMITTED_OUTPUT_TOKENS})."
                     ),
                 )
             try:
                 self.budget_controller.reserve(
                     reservation_id=reservation_id,
-                    prompt_text=prompt_context,
-                    max_output_tokens=self.max_output_tokens,
+                    prompt_or_payload=reserve_payload,
+                    max_output_tokens=effective_max_tokens,
                     description=f"Turn {turn_index}",
                 )
             except (BudgetExceededError, BudgetException) as err:
@@ -449,12 +673,14 @@ class AgentLoop:
             try:
                 import inspect
                 sig = inspect.signature(self.llm_client.chat_completion)
+                call_kwargs = {}
                 if "reservation_id" in sig.parameters:
-                    response = self.llm_client.chat_completion(
-                        messages, self.tools_schema, reservation_id=reservation_id
-                    )
-                else:
-                    response = self.llm_client.chat_completion(messages, self.tools_schema)
+                    call_kwargs["reservation_id"] = reservation_id
+                if "prepared_request" in sig.parameters and prepared_request is not None:
+                    call_kwargs["prepared_request"] = prepared_request
+                response = self.llm_client.chat_completion(
+                    messages, self.tools_schema, **call_kwargs
+                )
             except Exception as err:
                 self.budget_controller.record_network_failure(reservation_id)
                 return AgentLoopResult(
@@ -518,8 +744,65 @@ class AgentLoop:
                     TranscriptEntry(turn_index=turn_index, role="assistant", content=response.content)
                 )
 
-            # If no tool calls, model indicates it has finished
+            # If no tool calls, check if model emitted markdown file code blocks in text content
             if not response.tool_calls:
+                if response.content:
+                    extracted = self._extract_markdown_file_blocks(response.content)
+                    if extracted:
+                        self.transcript.append(
+                            TranscriptEntry(
+                                turn_index=turn_index,
+                                role="tool_result",
+                                tool_result=f"Extracted and wrote {len(extracted)} file(s) from response markdown blocks.",
+                            )
+                        )
+
+                # Check deliverable checklist completion
+                if self.deliverables_checklist and self.strict_completeness:
+                    completed, missing, next_target = self.get_deliverables_status()
+                    if missing:
+                        return AgentLoopResult(
+                            status=LoopTerminationStatus.INCOMPLETE_DELIVERABLES_ABORTED,
+                            total_turns=turn_index,
+                            transcript=self.transcript,
+                            error_message=(
+                                f"Model terminated turn without tool calls, leaving {len(missing)} deliverable(s) incomplete: "
+                                f"{missing}. Completed: {completed}."
+                            ),
+                            final_response=response.content,
+                        )
+                    else:
+                        # Run integration validation if all checklist files are present
+                        is_space_frac = any("space_fractions" in p for p in self.deliverables_checklist)
+                        from src.project_validator import ProjectValidator
+                        val_res = (
+                            ProjectValidator.validate_project(self.workspace_root, require_full_game=True, require_manifest=False)
+                            if is_space_frac
+                            else ProjectValidator.validate_generic_project(self.workspace_root)
+                        )
+                        if not val_res.success:
+                            if self._repair_attempts < self.max_repair_attempts and turn_index < self.max_turns:
+                                self._repair_attempts += 1
+                                err_bullets = "\n".join(f"- {e}" for e in val_res.errors[:4])
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"INTEGRATION VALIDATION FAILURE (Repair Attempt {self._repair_attempts}/{self.max_repair_attempts}):\n"
+                                        f"The generated project failed static contract validation with errors:\n"
+                                        f"{err_bullets}\n"
+                                        f"DIRECTIVE: Use write_file to repair the affected files. Keep all other verified code intact."
+                                    ),
+                                })
+                                continue
+                            else:
+                                return AgentLoopResult(
+                                    status=LoopTerminationStatus.REPAIR_EXHAUSTED_ABORTED,
+                                    total_turns=turn_index,
+                                    transcript=self.transcript,
+                                    error_message=f"Static integration contract validation failed after {self._repair_attempts} repair attempts: {'; '.join(val_res.errors[:3])}",
+                                    final_response=response.content,
+                                )
+
                 return AgentLoopResult(
                     status=LoopTerminationStatus.COMPLETED,
                     total_turns=turn_index,
@@ -537,11 +820,7 @@ class AgentLoop:
                 )
 
             # 6. Process tool calls
-            tool_call_dicts = [
-                {"id": tc.tool_id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
-                for tc in response.tool_calls
-            ]
-            messages.append({"role": "assistant", "content": response.content, "tool_calls": tool_call_dicts})
+            # First, record original assistant tool calls in transcript for audit integrity
             self.transcript.append(
                 TranscriptEntry(
                     turn_index=turn_index,
@@ -550,6 +829,8 @@ class AgentLoop:
                 )
             )
 
+            # Execute tool calls using original unmodified arguments
+            tool_dispatches = []
             for tc in response.tool_calls:
                 if self.cancel_event and self.cancel_event.is_set():
                     return AgentLoopResult(
@@ -578,11 +859,50 @@ class AgentLoop:
                         error_message=f"Circuit breaker tripped: tool '{tc.name}' failed identically {self._consecutive_failures} times.",
                     )
 
+                tool_dispatches.append((tc, capped_observation, is_error))
+
+            # If the turn failed due to output token truncation on a checklist deliverable:
+            if response.finish_reason == "length" and self.deliverables_checklist and next_target:
+                self.deliverable_retries[next_target] = self.deliverable_retries.get(next_target, 0) + 1
+                if self.deliverable_retries[next_target] > self.max_retries_per_deliverable:
+                    return AgentLoopResult(
+                        status=LoopTerminationStatus.SAFETY_ABORTED,
+                        total_turns=turn_index,
+                        transcript=self.transcript,
+                        error_message=(
+                            f"Model response truncated due to output token ceiling (finish_reason='length') "
+                            f"while generating '{next_target}'. "
+                            f"Retry limit reached ({self.max_retries_per_deliverable} attempts). "
+                            f"Halting to preserve valid disk state."
+                        ),
+                    )
+
+            # Build compacted assistant tool calls for context history based on actual execution outcome
+            tool_call_dicts = [
+                {
+                    "id": tc.tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(self._compact_tool_arguments_for_context(tc, is_success=(not is_err))),
+                    },
+                }
+                for tc, _, is_err in tool_dispatches
+            ]
+
+            # Bounded assistant text content for context history
+            asst_content = response.content
+            if asst_content and len(asst_content) > 1000:
+                asst_content = asst_content[:1000] + "... [truncated historical response text]"
+
+            messages.append({"role": "assistant", "content": asst_content, "tool_calls": tool_call_dicts})
+
+            for tc, capped_obs, _ in tool_dispatches:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.tool_id,
                     "name": tc.name,
-                    "content": capped_observation,
+                    "content": capped_obs,
                 })
                 self.transcript.append(
                     TranscriptEntry(
@@ -590,8 +910,66 @@ class AgentLoop:
                         role="tool_result",
                         tool_id=tc.tool_id,
                         tool_name=tc.name,
-                        tool_result=capped_observation,
+                        tool_result=capped_obs,
                     )
+                )
+
+            # Post-turn checklist evaluation and directive generation for next turn
+            if self.deliverables_checklist and turn_index < self.max_turns:
+                completed, missing, next_target = self.get_deliverables_status()
+                if missing and next_target:
+                    retries = self.deliverable_retries.get(next_target, 0)
+                    retry_prefix = f"RETRY DIRECTIVE ({retries}/{self.max_retries_per_deliverable}) " if retries > 0 else ""
+                    hint = self.get_deliverable_hint(next_target)
+                    hint_str = f" {hint}" if hint else ""
+                    next_guidance = (
+                        f"CHECKLIST: {len(completed)}/{len(self.deliverables_checklist)} completed. "
+                        f"{retry_prefix}DIRECTIVE FOR TURN {turn_index + 1}: Write ONLY '{next_target}' in this turn using write_file.{hint_str}"
+                    )
+                    messages.append({"role": "user", "content": next_guidance})
+                elif not missing:
+                    # All deliverables are present on disk; verify static contract
+                    is_space_frac = any("space_fractions" in p for p in self.deliverables_checklist)
+                    from src.project_validator import ProjectValidator
+                    val_res = (
+                        ProjectValidator.validate_project(self.workspace_root, require_full_game=True, require_manifest=False)
+                        if is_space_frac
+                        else ProjectValidator.validate_generic_project(self.workspace_root)
+                    )
+                    if val_res.success:
+                        messages.append({
+                            "role": "user",
+                            "content": "CHECKLIST: All required deliverables verified on disk. Provide a brief summary to conclude.",
+                        })
+                    else:
+                        if self._repair_attempts < self.max_repair_attempts:
+                            self._repair_attempts += 1
+                            err_bullets = "\n".join(f"- {e}" for e in val_res.errors[:4])
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"INTEGRATION VALIDATION FAILURE (Repair Attempt {self._repair_attempts}/{self.max_repair_attempts}):\n"
+                                    f"The generated project failed static acceptance contract validation with errors:\n"
+                                    f"{err_bullets}\n"
+                                    f"DIRECTIVE: Use write_file to repair the affected files. Keep all other verified code intact."
+                                ),
+                            })
+                        elif self.strict_completeness:
+                            return AgentLoopResult(
+                                status=LoopTerminationStatus.REPAIR_EXHAUSTED_ABORTED,
+                                total_turns=turn_index,
+                                transcript=self.transcript,
+                                error_message=f"Static integration contract validation failed after {self._repair_attempts} repair attempts: {'; '.join(val_res.errors[:3])}",
+                            )
+
+        if self.deliverables_checklist:
+            completed, missing, _ = self.get_deliverables_status()
+            if missing and self.strict_completeness:
+                return AgentLoopResult(
+                    status=LoopTerminationStatus.INCOMPLETE_DELIVERABLES_ABORTED,
+                    total_turns=self.max_turns,
+                    transcript=self.transcript,
+                    error_message=f"Agent loop reached maximum turn limit of {self.max_turns} with {len(missing)} incomplete deliverable(s): {missing}.",
                 )
 
         return AgentLoopResult(
@@ -600,6 +978,43 @@ class AgentLoop:
             transcript=self.transcript,
             error_message=f"Agent loop reached maximum turn limit of {self.max_turns}.",
         )
+
+    COMPACTED_CONTENT_MARKER: str = "[content omitted after local write]"
+
+    @classmethod
+    def _compact_tool_arguments_for_context(
+        cls, tool_call: ToolCall, is_success: bool = True
+    ) -> Dict[str, Any]:
+        """Returns bounded tool-call arguments for the next model turn.
+
+        - For completed successful write_file calls, content is replaced with
+          the compaction marker to avoid replaying large file source code.
+        - For failed write_file calls, content is NOT claimed to be written.
+        - For unparsed / malformed tool calls, dead-weight raw truncated strings
+          (_raw) are stripped to prevent replaying thousands of garbage chars.
+        """
+        args = tool_call.arguments
+        if not isinstance(args, dict):
+            return {"_invalid_arguments": str(args)[:200]}
+
+        # Strip unparsed / truncated _raw payloads from malformed tool calls
+        if "_parse_error" in args:
+            return {"_parse_error": str(args["_parse_error"])[:300]}
+
+        if tool_call.name == "write_file":
+            compact = dict(args)
+            content_val = args.get("content")
+            if is_success:
+                if isinstance(content_val, str):
+                    compact["content"] = cls.COMPACTED_CONTENT_MARKER
+                return compact
+            else:
+                # Write failed: do NOT claim content was written locally
+                if isinstance(content_val, str) and len(content_val) > 120:
+                    compact["content"] = f"[write failed: {len(content_val)} chars omitted]"
+                return compact
+
+        return args
 
     def _dispatch_tool(self, tool_call: ToolCall) -> tuple[str, bool]:
         """Dispatches a validated tool call. Never crashes; returns error strings on failure."""
@@ -630,6 +1045,21 @@ class AgentLoop:
                     return "Error: Tool 'write_file' requires string arguments 'path' and 'content'.", True
                 if not isinstance(args["path"], str) or not isinstance(args["content"], str):
                     return "Error: Invalid argument types for 'write_file'. 'path' and 'content' must be strings.", True
+
+                # Compaction placeholder rejection:
+                # Reject writes attempting to output the internal compaction marker or placeholder
+                raw_content = args["content"]
+                stripped_content = raw_content.strip()
+                if (
+                    stripped_content == self.COMPACTED_CONTENT_MARKER
+                    or stripped_content.startswith("[content omitted")
+                    or "[content omitted after local write]" in raw_content
+                ):
+                    return (
+                        "Error: Write rejected. Tool argument 'content' contains internal context compaction placeholder. "
+                        "You must supply the actual, full file source code to write.",
+                        True,
+                    )
 
                 # Null byte rejection
                 if "\0" in args["path"] or "\0" in args["content"]:
@@ -667,6 +1097,34 @@ class AgentLoop:
                 file_existed = os.path.isfile(target_full_path)
                 if file_existed and not overwrite:
                     return f"Error: File '{args['path']}' already exists and overwrite is set to False.", True
+
+                # Avoid redundant re-writes of already completed and verified deliverables
+                norm_rel = os.path.normpath(args["path"]).replace("\\", "/")
+                force_overwrite = args.get("force_overwrite", False)
+                if (
+                    not force_overwrite
+                    and self.deliverables_checklist
+                    and norm_rel in self.deliverables_checklist
+                    and self.is_deliverable_complete(norm_rel)
+                ):
+                    _, _, next_missing = self.get_deliverables_status()
+                    next_hint = f" Please proceed to next missing deliverable: '{next_missing}'." if next_missing else " All deliverables complete."
+                    return (
+                        f"Notice: Deliverable '{args['path']}' is already completed and verified on disk. "
+                        f"Skipped redundant re-write to preserve verified state.{next_hint}",
+                        False,
+                    )
+
+                # For Python files, if the file already exists on disk, protect it against overwrite with truncated/broken syntax
+                if file_existed and args["path"].endswith(".py"):
+                    try:
+                        ast.parse(args["content"], filename=args["path"])
+                    except SyntaxError as syn_err:
+                        return (
+                            f"Error: Python syntax error in '{args['path']}': {syn_err}. "
+                            f"The content appears truncated or incomplete. File was not written to disk.",
+                            True,
+                        )
 
                 safe_write_file(self.workspace_root, args["path"], args["content"])
                 action = "overwrote" if file_existed else "wrote"
@@ -739,4 +1197,70 @@ class AgentLoop:
             return f"ToolExecutionError: Unexpected failure executing '{name}': {err}", True
 
         return "Error: Unhandled execution state.", True
+
+    def _extract_markdown_file_blocks(self, text: Optional[str]) -> List[str]:
+        """Extracts and writes files declared in markdown code blocks as a safe fallback.
+        
+        Supports common patterns:
+        - ```python:path/to/file.py ... ```
+        - ```python filepath="path/to/file.py" ... ```
+        - File: `path/to/file.py` followed by ```python ... ```
+        - **path/to/file.py** followed by ```python ... ```
+        """
+        if not text or not isinstance(text, str):
+            return []
+
+        written: List[str] = []
+        import re
+
+        # Pattern 1: ```python:path/to/file.py or ```python filepath="path/to/file.py" or ```python filename="path/to/file.py"
+        pat1 = re.compile(
+            r'```[a-zA-Z0-9_\-\.]*[:\s]+(?:filepath=|filename=)?["`\']?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]+)["`\']?\s*\n(.*?)```',
+            re.DOTALL,
+        )
+        for m in pat1.finditer(text):
+            rel_p = m.group(1).strip()
+            content = m.group(2)
+            if self._safe_write_extracted_block(rel_p, content):
+                written.append(rel_p)
+
+        # Pattern 2: (?:###|##|#|\*\*|File:)\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]+)`?\s*\n+```[a-zA-Z0-9_\-\.]*\s*\n(.*?)```
+        pat2 = re.compile(
+            r'(?:###|##|#|\*\*|File:)\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]+)`?[:\s]*\n+```[a-zA-Z0-9_\-\.]*\s*\n(.*?)```',
+            re.DOTALL,
+        )
+        for m in pat2.finditer(text):
+            rel_p = m.group(1).strip()
+            content = m.group(2)
+            if rel_p not in written and self._safe_write_extracted_block(rel_p, content):
+                written.append(rel_p)
+
+        return written
+
+    def _safe_write_extracted_block(self, rel_path: str, content: str) -> bool:
+        """Validates path security and writes extracted content to workspace."""
+        try:
+            norm_rel = rel_path.strip().lstrip("/\\")
+            if not norm_rel or "\0" in norm_rel:
+                return False
+            # Canonical architecture specifications protection
+            target_basename = os.path.basename(norm_rel).strip().lower()
+            if target_basename in ("architecture_documentation.md", "architecture_view.md"):
+                return False
+            # Compaction placeholder rejection
+            stripped_content = content.strip()
+            if (
+                stripped_content == self.COMPACTED_CONTENT_MARKER
+                or stripped_content.startswith("[content omitted")
+                or "[content omitted after local write]" in content
+            ):
+                return False
+            # Path containment validation
+            validate_workspace_path(self.workspace_root, norm_rel)
+            if len(content.encode("utf-8")) > self.MAX_FILE_WRITE_BYTES:
+                return False
+            safe_write_file(self.workspace_root, norm_rel, content)
+            return True
+        except Exception:
+            return False
 
