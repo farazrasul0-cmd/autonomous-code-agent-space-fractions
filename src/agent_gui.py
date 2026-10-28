@@ -495,13 +495,20 @@ class AgentGUIApp:
             except Exception:
                 pass
 
-        self.style.configure("Title.TLabel", font=("Segoe UI", 13, "bold"), foreground="#1A202C")
-        self.style.configure("Subtitle.TLabel", font=("Segoe UI", 9), foreground="#4A5568")
-        self.style.configure("Header.TLabelframe.Label", font=("Segoe UI", 9, "bold"), foreground="#2D3748")
+        # Explicitly enforce clean light Windows desktop theme across all default ttk elements
+        self.style.configure(".", background="SystemButtonFace", foreground="#000000")
+        self.style.configure("TFrame", background="SystemButtonFace")
+        self.style.configure("TLabelframe", background="SystemButtonFace")
+        self.style.configure("TLabelframe.Label", background="SystemButtonFace", foreground="#2D3748")
+        self.style.configure("TLabel", background="SystemButtonFace", foreground="#000000")
+
+        self.style.configure("Title.TLabel", font=("Segoe UI", 13, "bold"), foreground="#1A202C", background="SystemButtonFace")
+        self.style.configure("Subtitle.TLabel", font=("Segoe UI", 9), foreground="#4A5568", background="SystemButtonFace")
+        self.style.configure("Header.TLabelframe.Label", font=("Segoe UI", 9, "bold"), foreground="#2D3748", background="SystemButtonFace")
         self.style.configure("Primary.TButton", font=("Segoe UI", 9, "bold"))
         self.style.configure("Danger.TButton", font=("Segoe UI", 9))
-        self.style.configure("TelemetryValue.TLabel", font=("Segoe UI", 10, "bold"), foreground="#2B6CB0")
-        self.style.configure("ModeBadge.TLabel", font=("Segoe UI", 9, "bold"), foreground="#C53030")
+        self.style.configure("TelemetryValue.TLabel", font=("Segoe UI", 10, "bold"), foreground="#2B6CB0", background="SystemButtonFace")
+        self.style.configure("ModeBadge.TLabel", font=("Segoe UI", 9, "bold"), foreground="#C53030", background="SystemButtonFace")
 
     def _build_ui(self) -> None:
         """Constructs the complete hierarchical widget tree."""
@@ -1067,6 +1074,7 @@ class AgentGUIApp:
         finally:
             self._game_window = None
             self._game_app = None
+            self._setup_styles()
             self._append_log("Space Fractions Game window closed cleanly.", "INFO")
 
     def launch_playable_game(self) -> None:
@@ -1092,6 +1100,7 @@ class AgentGUIApp:
             self._game_window = game_window
             game_window.protocol("WM_DELETE_WINDOW", self._on_game_window_close)
             self._game_app = SpaceFractionsApp(game_window)
+            self._setup_styles()
             self._append_log("Launched Space Fractions Desktop Game window.", "SUCCESS")
         except Exception:
             self._game_window = None

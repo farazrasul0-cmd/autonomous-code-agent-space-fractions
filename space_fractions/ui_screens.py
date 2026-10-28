@@ -21,10 +21,6 @@ def setup_cosmic_theme(style: Optional[ttk.Style] = None) -> ttk.Style:
     """Configures cosmic learning theme with dark deep-space palette and elevated cards."""
     if style is None:
         style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
 
     # Palette
     BG_DEEP = "#0B0F19"
@@ -38,7 +34,6 @@ def setup_cosmic_theme(style: Optional[ttk.Style] = None) -> ttk.Style:
     EMERALD_GREEN = "#10B981"
     CRIMSON_RED = "#EF4444"
 
-    style.configure(".", background=BG_DEEP, foreground=TEXT_WHITE)
     style.configure("Cosmic.TFrame", background=BG_DEEP)
     style.configure("Card.TFrame", background=SURFACE_CARD, relief="solid", borderwidth=1)
     style.configure("HUDCard.TFrame", background=SURFACE_CARD, relief="solid", borderwidth=1)
@@ -200,8 +195,8 @@ class HUDFrame(ttk.Frame):
             card = ttk.Frame(self, style="HUDCard.TFrame", padding="4 6")
             card.grid(row=0, column=col, padx=3, pady=2, sticky="nsew")
 
-            ttk.Label(card, text=title, font=("Segoe UI", 7, "bold"), foreground="#94A3B8").pack(anchor=tk.W)
-            val_lbl = ttk.Label(card, textvariable=var, font=("Segoe UI", 10, "bold"), foreground=color)
+            ttk.Label(card, text=title, font=("Segoe UI", 7, "bold"), foreground="#94A3B8", background="#111827").pack(anchor=tk.W)
+            val_lbl = ttk.Label(card, textvariable=var, font=("Segoe UI", 10, "bold"), foreground=color, background="#111827")
             val_lbl.pack(anchor=tk.W)
             self.metric_labels[title] = val_lbl
 
