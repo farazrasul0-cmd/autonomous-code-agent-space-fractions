@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from src.budget_controller import BudgetController, BudgetExceededError, BudgetException, ReservationState
 from src.path_security import PathSecurityError, safe_read_file, safe_write_file, validate_workspace_path
+from src.project_validator import ProjectValidator
 
 
 class LoopTerminationStatus(str, Enum):
@@ -326,8 +327,16 @@ class LLMClientProtocol(Protocol):
 class AgentLoop:
     """Core ReAct Agent loop with strict contract enforcement and defensive execution."""
 
-    MAX_TURNS_DEFAULT = 12
+    # Eight canonical deliverables plus bounded recovery capacity for truncated or
+    # schema-rejected writes.  Sixteen worst-case reserved turns remain comfortably
+    # below the application's $0.80 ceiling at configured peak token rates.
+    MAX_TURNS_DEFAULT = 24
     MAX_OBSERVATION_CHARS = 1500
+    # Leave headroom for model/options fields added by DeepSeekClient.prepare_request.
+    # Once this conservative request estimate is reached, older completed ReAct
+    # envelopes are redundant because validated deliverables live on disk and the
+    # current checklist directive is authoritative.
+    CONTEXT_COMPACTION_TRIGGER = 7000
     MAX_CONSECUTIVE_IDENTICAL_FAILURES = 3
 
     # Formal tool schemas exposed to the model
@@ -417,7 +426,7 @@ class AgentLoop:
         authorized_target: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         deliverables_checklist: Optional[List[str]] = None,
-        max_retries_per_deliverable: int = 2,
+        max_retries_per_deliverable: int = 3,
         max_repair_attempts: int = 2,
         strict_completeness: bool = False,
     ) -> None:
@@ -493,6 +502,23 @@ class AgentLoop:
                 if not tree.body:
                     return False, [f"File '{norm_path}' contains zero code statements (comment/empty stub only)."]
 
+                package_ok, package_errors = ProjectValidator.validate_package_imports(tree, norm_path)
+                if not package_ok:
+                    return False, package_errors
+
+                interface_validators = {
+                    "space_fractions/fraction_math.py": ProjectValidator.validate_fraction_math_interface,
+                    "space_fractions/game_engine.py": ProjectValidator.validate_game_engine_interface,
+                    "space_fractions/ui_screens.py": ProjectValidator.validate_ui_screens_interface,
+                    "space_fractions/main.py": ProjectValidator.validate_gui_app_interface,
+                    "tests/test_fraction_game.py": ProjectValidator.validate_test_suite_interface,
+                }
+                validator = interface_validators.get(norm_path)
+                if validator is not None:
+                    interface_ok, interface_errors = validator(tree)
+                    if not interface_ok:
+                        return False, interface_errors
+
             elif norm_path == "README.md":
                 if size == 0:
                     return False, [f"README.md is empty (0 bytes)."]
@@ -557,16 +583,52 @@ class AgentLoop:
     @classmethod
     def get_deliverable_hint(cls, target: str) -> str:
         """Returns concise targeted instructions to prevent model over-generation and output truncation."""
+        if target == "space_fractions/fraction_math.py":
+            return (
+                "This is a package module: import siblings only with '.sibling' or 'space_fractions.sibling', never bare sibling imports. "
+                "Use public numerator and denominator attributes. The constructor MUST preserve the supplied values without reducing them; "
+                "simplify() performs reduction and must return a new Fraction without mutating the original; "
+                "add() and subtract() MUST return simplified results by calling .simplify(); "
+                "__eq__() MUST delegate to equals() for value equality; __str__() MUST call simplify() first and render "
+                "whole-number values without a denominator (Fraction(6, 3) -> '2'); "
+                "equals(non-Fraction) must return False. MathQuestionGenerator.generate() MUST return a dict "
+                "with exactly these shared keys: prompt, options, correct_index, explanation; options MUST be a list "
+                "of display strings (not Fraction objects), because the engine and Tkinter UI render them directly. "
+                "Question and distractor generation MUST never construct a Fraction with denominator zero; "
+                "guard randomized denominator arithmetic before constructing Fraction objects. Tests MUST call "
+                "generate() repeatedly (at least 100 times) to verify every option is a string, every index is valid, "
+                "and generation never raises."
+            )
+        if target == "space_fractions/game_engine.py":
+            return (
+                "This is a package module: import siblings only with '.sibling' or 'space_fractions.sibling', never bare sibling imports. "
+                "Consume generate() as a dict with prompt, options, correct_index, explanation. Expose public score, "
+                "lives, current_question and state; initialize in PLAYING with a current question. Implement play(), "
+                "pause(), resume(), submit_answer(index)->bool, is_game_over(), view_score(), and viewScore()."
+            )
+        if target == "space_fractions/question_bank.py":
+            return (
+                "This is a package module: import siblings only with '.sibling' or 'space_fractions.sibling', never bare sibling imports. "
+                "Provide Grade 6 fraction questions using the shared dict contract: "
+                "prompt, options, correct_index, explanation."
+            )
+        if target == "space_fractions/ui_screens.py":
+            return (
+                "This is a package module: import siblings only with '.sibling' or 'space_fractions.sibling', never bare sibling imports. "
+                "Render the shared question dict keys prompt, options, correct_index, explanation. "
+                "Define FractionVisualizer and HUDFrame as reusable Tkinter widgets."
+            )
         if target == "space_fractions/main.py":
             return (
                 "Keep space_fractions/main.py minimal and focused (under 150 lines): define class SpaceFractionsApp(root) and def main(). "
-                "Import FractionVisualizer and HUDFrame from space_fractions.ui_screens, and GameEngine and GameState from space_fractions.game_engine. "
+                "Use package-safe relative imports: from .ui_screens import FractionVisualizer, HUDFrame and from .game_engine import GameEngine, GameState. "
                 "Connect start, play, pause, and game-over screens without re-implementing existing widgets or math logic."
             )
         if target == "tests/test_fraction_game.py":
             return (
-                "Write self-contained unit tests: test_ functions verifying Fraction arithmetic (add, subtract, simplify, compare, equals), "
-                "MathQuestionGenerator, and GameEngine state transitions (play, pause, submit_answer, game_over)."
+                "Write self-contained unittest tests matching the exact shared contract: generate() returns a dict with "
+                "prompt/options/correct_index/explanation; GameEngine starts PLAYING with current_question and "
+                "submit_answer(index) returns bool. Verify Fraction arithmetic and state transitions."
             )
         if target == "requirements.txt":
             return "Python standard library only. Write a comment header noting no third-party dependencies are required."
@@ -619,6 +681,14 @@ class AgentLoop:
                 )
 
             turn_index += 1
+
+            # Successful file bodies are already compacted below, but retaining every
+            # assistant/tool/directive envelope still grows linearly and previously
+            # made the canonical eight-deliverable task fail before turn 8.  Keep the
+            # immutable task plus the most recent ReAct exchange when the next request
+            # approaches the hard input bound.  The full audit transcript is retained.
+            messages = self._compact_message_history_if_needed(messages)
+
             if effective_session_id:
                 reservation_id = f"run-{effective_session_id}-turn-{turn_index}"
             else:
@@ -926,6 +996,12 @@ class AgentLoop:
                         f"CHECKLIST: {len(completed)}/{len(self.deliverables_checklist)} completed. "
                         f"{retry_prefix}DIRECTIVE FOR TURN {turn_index + 1}: Write ONLY '{next_target}' in this turn using write_file.{hint_str}"
                     )
+                    rejection_details = [obs for _, obs, is_error in tool_dispatches if is_error]
+                    if rejection_details:
+                        bounded_errors = "; ".join(
+                            " ".join(detail.split())[:500] for detail in rejection_details[:2]
+                        )
+                        next_guidance += f" PREVIOUS WRITE REJECTION: {bounded_errors}"
                     messages.append({"role": "user", "content": next_guidance})
                 elif not missing:
                     # All deliverables are present on disk; verify static contract
@@ -980,6 +1056,64 @@ class AgentLoop:
         )
 
     COMPACTED_CONTENT_MARKER: str = "[content omitted after local write]"
+
+    def _compact_message_history_if_needed(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Bounds multi-turn request context without weakening task or audit state.
+
+        The initial system/user pair carries the task contract.  The latest assistant
+        exchange, tool observations, and following user directive carry all actionable
+        recovery information.  Earlier exchanges describe files whose authoritative
+        state is revalidated from disk by the deliverables manifest.
+        """
+        # Checklist generation is disk-driven. Prior assistant tool calls contain a
+        # local compaction marker which providers may imitate verbatim. Once the
+        # manifest has revalidated disk state, retain only the original task and the
+        # newest actionable user directive/error.
+        if (
+            self.deliverables_checklist
+            and isinstance(self.llm_client, DeepSeekAgentAdapter)
+            and len(messages) > 3
+        ):
+            latest_user = next(
+                (messages[index] for index in range(len(messages) - 1, 1, -1)
+                 if messages[index].get("role") == "user"),
+                None,
+            )
+            if latest_user is not None:
+                return messages[:2] + [latest_user]
+
+        estimate_payload = {"messages": messages, "tools": self.tools_schema}
+        estimate = self.budget_controller.calculate_request_token_bound(estimate_payload)
+        if estimate <= self.CONTEXT_COMPACTION_TRIGGER or len(messages) <= 4:
+            return messages
+
+        prefix = messages[:2]
+        last_assistant = next(
+            (index for index in range(len(messages) - 1, 1, -1)
+             if messages[index].get("role") == "assistant"),
+            None,
+        )
+        if last_assistant is None:
+            return messages
+
+        compacted = prefix + messages[last_assistant:]
+        compacted_estimate = self.budget_controller.calculate_request_token_bound(
+            {"messages": compacted, "tools": self.tools_schema}
+        )
+        if compacted_estimate <= self.CONTEXT_COMPACTION_TRIGGER:
+            return compacted
+
+        # Extremely verbose tool observations are diagnostic, not authoritative.
+        # Bound only the retained historical copies; the transcript stays complete.
+        bounded: List[Dict[str, Any]] = []
+        for message in compacted:
+            copied = dict(message)
+            if copied.get("role") == "tool" and isinstance(copied.get("content"), str):
+                copied["content"] = copied["content"][:600]
+            bounded.append(copied)
+        return bounded
 
     @classmethod
     def _compact_tool_arguments_for_context(

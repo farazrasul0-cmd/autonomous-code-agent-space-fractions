@@ -44,7 +44,11 @@ def validate_workspace_path(workspace_root: str, relative_path: str) -> str:
         raise PathSecurityError(f"UNC network paths are prohibited: '{relative_path}'")
 
     # Reject absolute paths (POSIX absolute '/' or Windows drive letters 'C:')
-    if os.path.isabs(relative_path) or (len(relative_path) >= 2 and relative_path[1] == ":"):
+    if (
+        os.path.isabs(relative_path)
+        or relative_path.startswith(("/", "\\"))
+        or (len(relative_path) >= 2 and relative_path[1] == ":")
+    ):
         raise PathSecurityError(f"Absolute paths are prohibited: '{relative_path}'")
 
     # Canonicalize the workspace root (resolving symlinks in the root itself)

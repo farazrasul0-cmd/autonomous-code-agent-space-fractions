@@ -305,6 +305,86 @@ def test_ast_game_engine_interfaces():
     assert ok is True, f"Game Engine Interface validation failed: {errs}"
 
 
+def test_static_validator_rejects_bare_sibling_package_imports():
+    tree = ast.parse("from fraction_math import Fraction\nimport question_bank\n")
+    ok, errs = ProjectValidator.validate_package_imports(tree, "space_fractions/game_engine.py")
+    assert ok is False
+    assert len(errs) == 2
+    assert all("Invalid package import" in err for err in errs)
+
+
+def test_static_validator_accepts_relative_and_qualified_package_imports():
+    tree = ast.parse(
+        "from .fraction_math import Fraction\n"
+        "from space_fractions.question_bank import QuestionBank\n"
+    )
+    ok, errs = ProjectValidator.validate_package_imports(tree, "space_fractions/game_engine.py")
+    assert ok is True
+    assert errs == []
+
+
+def test_fraction_interface_rejects_constructor_reduction():
+    tree = ast.parse(
+        "import math\n"
+        "class Fraction:\n"
+        " def __init__(self, numerator, denominator):\n"
+        "  divisor = math.gcd(numerator, denominator)\n"
+        "  self.numerator = numerator // divisor\n"
+        "  self.denominator = denominator // divisor\n"
+        " def simplify(self): pass\n"
+        " def add(self): pass\n"
+        " def subtract(self): pass\n"
+        " def compare(self): pass\n"
+        " def equals(self): pass\n"
+        "class MathQuestionGenerator:\n"
+        " def generate(self): pass\n"
+    )
+    ok, errs = ProjectValidator.validate_fraction_math_interface(tree)
+    assert ok is False
+    assert any("must preserve" in err for err in errs)
+
+
+def test_fraction_interface_rejects_unsimplified_arithmetic_and_fractional_whole_string():
+    tree = ast.parse(
+        "class Fraction:\n"
+        " def __init__(self, numerator, denominator=1):\n"
+        "  self.numerator, self.denominator = numerator, denominator\n"
+        " def simplify(self): return Fraction(self.numerator, self.denominator)\n"
+        " def add(self, other): return Fraction(self.numerator + other.numerator, self.denominator)\n"
+        " def subtract(self, other): return Fraction(self.numerator - other.numerator, self.denominator)\n"
+        " def compare(self, other): return 0\n"
+        " def equals(self, other): return True\n"
+        " def __str__(self): return f'{self.numerator}/{self.denominator}'\n"
+        "class MathQuestionGenerator:\n"
+        " def generate(self): return {}\n"
+    )
+    ok, errs = ProjectValidator.validate_fraction_math_interface(tree)
+    assert ok is False
+    assert any("add() must return a simplified" in err for err in errs)
+    assert any("subtract() must return a simplified" in err for err in errs)
+    assert any("whole-number values" in err for err in errs)
+
+
+def test_fraction_interface_rejects_missing_value_equality_and_unsimplified_string():
+    tree = ast.parse(
+        "class Fraction:\n"
+        " def __init__(self, n, d=1): self.n, self.d = n, d\n"
+        " def simplify(self): return Fraction(self.n, self.d)\n"
+        " def add(self, other): return Fraction(self.n, self.d).simplify()\n"
+        " def subtract(self, other): return Fraction(self.n, self.d).simplify()\n"
+        " def compare(self, other): return 0\n"
+        " def equals(self, other): return True\n"
+        " def __eq__(self, other): return False\n"
+        " def __str__(self): return str(self.n) if self.d == 1 else f'{self.n}/{self.d}'\n"
+        "class MathQuestionGenerator:\n"
+        " def generate(self): return {}\n"
+    )
+    ok, errs = ProjectValidator.validate_fraction_math_interface(tree)
+    assert ok is False
+    assert any("delegate to equals" in err for err in errs)
+    assert any("simplify a copy first" in err for err in errs)
+
+
 # =============================================================================
 # 5. Playable Game Implementation & Verification Tests (Phase 2.27.29)
 # =============================================================================
@@ -335,7 +415,7 @@ def test_curated_question_bank_size_and_diversity():
     for lvl in (1, 2, 3):
         qs = [q for q in CURATED_QUESTIONS if q.level == lvl]
         assert len(qs) >= 5, f"Level {lvl} has insufficient questions: {len(qs)}"
-        
+
     for q in CURATED_QUESTIONS:
         assert len(q.prompt.strip()) > 0
         assert len(q.options) == 4
@@ -365,7 +445,7 @@ def test_fraction_visualizer_rendering_headless():
     try:
         vis = FractionVisualizer(root, width=240, height=180)
         vis.pack()
-        
+
         vis.draw_fraction(1, 2)
         assert len(vis.find_all()) > 0
         
@@ -439,11 +519,83 @@ def test_desktop_app_gameplay_lifecycle_headless():
             wrong_idx = (app.engine.current_question.correct_index + 1) % 4
             app.handle_answer(wrong_idx)
             app.advance_after_feedback()
-            
+
         assert app.engine.state == GameState.GAMEOVER
         
         # Test restart
         app.show_title_screen()
         assert app.engine.state == GameState.GAMEOVER or app.engine.state == GameState.TITLE
+    finally:
+        root.destroy()
+
+
+def test_question_screen_pause_resume_visible_state_changes():
+    """Verifies that QuestionScreen updates its pause button label and option states."""
+    from space_fractions.ui_screens import QuestionScreen
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        screen = QuestionScreen(root)
+        screen.display_question({"prompt": "1/2 + 1/2", "options": ["1", "2", "3", "4"]})
+
+        # Initial: Unpaused
+        assert screen.pause_button.cget("text") == "Pause"
+        assert str(screen.option_buttons[0].cget("state")) == "normal"
+        assert screen.is_paused is False
+
+        # Pause transition: Button becomes Resume, label visible, options disabled
+        screen.set_paused(True)
+        assert screen.pause_button.cget("text") == "Resume"
+        assert screen.is_paused is True
+        for btn in screen.option_buttons:
+            assert str(btn.cget("state")) == "disabled"
+
+        # Resume transition: Button reverts to Pause, label hidden, options re-enabled
+        screen.set_paused(False)
+        assert screen.pause_button.cget("text") == "Pause"
+        assert screen.is_paused is False
+        for btn in screen.option_buttons:
+            assert str(btn.cget("state")) == "normal"
+    finally:
+        root.destroy()
+
+
+def test_cosmic_ui_screens_components_and_2x2_grid():
+    """Verifies that cosmic UI components, 2x2 grid geometry, and debrief rank calculation function properly."""
+    from space_fractions.ui_screens import TitleScreen, QuestionScreen, GameOverScreen, setup_cosmic_theme
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        setup_cosmic_theme()
+
+        # Test TitleScreen
+        started = []
+        title_screen = TitleScreen(root, on_start=lambda: started.append(True))
+        title_screen.btn_launch.invoke()
+        assert len(started) == 1
+
+        # Test QuestionScreen 2x2 grid
+        q_screen = QuestionScreen(root)
+        q_screen.display_question({"prompt": "Simplify 4/8", "options": ["1/4", "1/2", "3/4", "2/3"]})
+        assert len(q_screen.option_buttons) == 4
+
+        # Check grid positioning (2 rows, 2 columns)
+        grid_info_0 = q_screen.option_buttons[0].grid_info()
+        grid_info_1 = q_screen.option_buttons[1].grid_info()
+        grid_info_2 = q_screen.option_buttons[2].grid_info()
+        grid_info_3 = q_screen.option_buttons[3].grid_info()
+
+        assert int(grid_info_0["row"]) == 0 and int(grid_info_0["column"]) == 0
+        assert int(grid_info_1["row"]) == 0 and int(grid_info_1["column"]) == 1
+        assert int(grid_info_2["row"]) == 1 and int(grid_info_2["column"]) == 0
+        assert int(grid_info_3["row"]) == 1 and int(grid_info_3["column"]) == 1
+
+        # Test GameOverScreen debrief calculation
+        game_over = GameOverScreen(root)
+        game_over.display_results(score=1200, questions_answered=10, correct_answers=9)
+        assert "1200" in game_over._score_label.cget("text")
+        assert "9/10" in game_over._questions_label.cget("text")
+        assert "90%" in game_over._accuracy_label.cget("text")
+        assert "Fleet Admiral" in game_over._rank_label.cget("text")
     finally:
         root.destroy()

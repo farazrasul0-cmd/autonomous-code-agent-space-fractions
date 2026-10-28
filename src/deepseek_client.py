@@ -59,6 +59,15 @@ class DeepSeekCancellationError(DeepSeekClientError):
         self.is_ambiguous = is_ambiguous
 
 
+@dataclass(frozen=True)
+class PreparedRequest:
+    """Immutable pre-serialized request bundle guaranteeing parity between reservation and transmission."""
+    serialized_bytes: bytes
+    payload: Dict[str, Any]
+    max_output_tokens: int
+    token_bound: int
+
+
 @dataclass
 class DeepSeekResponse:
     """Structured result returned by DeepSeekClient."""
@@ -94,6 +103,7 @@ class DeepSeekClient:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         budget_controller: Optional[BudgetController] = None,
         transport_sender: Optional[Callable[[urllib.request.Request, float], Tuple[int, bytes]]] = None,
+        audit_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         if not api_key or not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("API key must be a non-empty string.")
@@ -107,6 +117,7 @@ class DeepSeekClient:
             raise ValueError(f"max_output_tokens must be an integer between 1 and 4096, got {max_output_tokens}")
         self.max_output_tokens: int = max_output_tokens
         self.budget_controller: Optional[BudgetController] = budget_controller
+        self.audit_callback: Optional[Callable[[str, Dict[str, Any]], None]] = audit_callback
 
         # Custom transport hook for unit test mocking without socket connection
         self._transport_sender: Optional[
@@ -145,21 +156,52 @@ class DeepSeekClient:
             payload["tools"] = tools
         return payload
 
-    def send_chat_completion(
+    def prepare_request(
         self,
         messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.0,
+    ) -> PreparedRequest:
+        """Prepares and serializes request payload once into immutable UTF-8 bytes.
+
+        Reconstructs payload from exact serialized bytes and bounds input tokens
+        conservatively. Guarantees 100% parity between budget reservation and
+        wire transmission.
+        """
+        payload = self.prepare_payload(messages, tools, max_tokens, temperature)
+        serialized_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        reconstructed = json.loads(serialized_bytes.decode("utf-8"))
+        if self.budget_controller is not None:
+            token_bound = self.budget_controller.calculate_request_token_bound(reconstructed)
+        else:
+            token_bound = BudgetController.calculate_request_token_bound(reconstructed)
+
+        return PreparedRequest(
+            serialized_bytes=serialized_bytes,
+            payload=reconstructed,
+            max_output_tokens=payload["max_tokens"],
+            token_bound=token_bound,
+        )
+
+    def send_chat_completion(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.0,
         reservation_id: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
         skip_budget_reservation: bool = False,
+        prepared_request: Optional[PreparedRequest] = None,
     ) -> DeepSeekResponse:
         """Submits a bounded Chat Completions request to the official DeepSeek API.
 
         Guarantees:
         - Checks cancellation before reservation and before socket transmission.
         - Conservative pre-call budget reservation encompassing full payload + max output tokens.
+        - Strict token-bound and output-token parity verification before transmission.
+        - Immutable serialized bytes sent without re-serialization or mutation.
         - Rejects requests exceeding remaining budget before network transmission.
         - No automatic retries under any error.
         - Zero credential leakage in exceptions or returned data structures.
@@ -179,7 +221,17 @@ class DeepSeekClient:
                 reservation_id=req_id,
             )
 
-        payload = self.prepare_payload(messages, tools, max_tokens, temperature)
+        if prepared_request is not None:
+            payload = prepared_request.payload
+            serialized_body = prepared_request.serialized_bytes
+            req_token_bound = prepared_request.token_bound
+        else:
+            if messages is None:
+                raise ValueError("Must provide either messages or prepared_request.")
+            prep = self.prepare_request(messages, tools, max_tokens, temperature)
+            payload = prep.payload
+            serialized_body = prep.serialized_bytes
+            req_token_bound = prep.token_bound
 
         # ---------------------------------------------------------------------
         # 2. Budget Preflight Reservation Gate
@@ -193,7 +245,21 @@ class DeepSeekClient:
                     max_output_tokens=payload["max_tokens"],
                     description=f"DeepSeek call ({self.model})",
                 )
+                if self.audit_callback:
+                    self.audit_callback("RESERVATION_ACCEPTED", {
+                        "event": "RESERVATION_ACCEPTED",
+                        "reservation_id": req_id,
+                        "token_bound": req_token_bound,
+                        "max_output_tokens": payload["max_tokens"],
+                        "reserved_usd": round(reserved_amount, 6),
+                    })
             except BudgetExceededError as err:
+                if self.audit_callback:
+                    self.audit_callback("RESERVATION_REJECTED", {
+                        "event": "RESERVATION_REJECTED",
+                        "reservation_id": req_id,
+                        "reason": "BudgetExceededError",
+                    })
                 return DeepSeekResponse(
                     status=RequestOutcomeStatus.BUDGET_REJECTED,
                     is_success=False,
@@ -211,6 +277,19 @@ class DeepSeekClient:
                     f"Pre-transmission token mismatch: reservation '{req_id}' holds {active_rec.max_output_tokens} "
                     f"output tokens, but request payload specifies {payload['max_tokens']}."
                 )
+            if active_rec.token_bound != req_token_bound:
+                raise BudgetException(
+                    f"Pre-transmission token bound mismatch: reservation '{req_id}' holds {active_rec.token_bound} "
+                    f"input tokens bound, but request payload evaluates to {req_token_bound}."
+                )
+            if self.audit_callback:
+                self.audit_callback("RESERVATION_ACCEPTED", {
+                    "event": "RESERVATION_ACCEPTED",
+                    "reservation_id": req_id,
+                    "token_bound": req_token_bound,
+                    "max_output_tokens": payload["max_tokens"],
+                    "reserved_usd": round(active_rec.reserved_amount, 6),
+                })
 
         # ---------------------------------------------------------------------
         # 3. Cancellation Check 2: Immediately Before Network Transmission
@@ -231,7 +310,6 @@ class DeepSeekClient:
         # 4. Construct Request with Strictly Redacted Headers
         # ---------------------------------------------------------------------
         url = f"{self.base_url}/chat/completions"
-        serialized_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         headers = {
             "Content-Type": "application/json",
@@ -258,6 +336,14 @@ class DeepSeekClient:
             if target_res_id and target_res_id in self.budget_controller.active_reservations:
                 self.budget_controller.mark_transmission_started(target_res_id)
 
+        if self.audit_callback:
+            self.audit_callback("LOCAL_TRANSPORT_ENTRY", {
+                "event": "LOCAL_TRANSPORT_ENTRY",
+                "method": "POST",
+                "url_path": "/chat/completions",
+                "payload_bytes": len(serialized_body),
+            })
+
         try:
             if self._transport_sender is not None:
                 # Mock transport execution for offline testing
@@ -280,6 +366,18 @@ class DeepSeekClient:
                 self.budget_controller.record_network_failure(req_id)
 
             latency = (time.monotonic() - start_time) * 1000.0
+            if self.audit_callback:
+                self.audit_callback("LOCAL_TRANSPORT_RETURN", {
+                    "event": "LOCAL_TRANSPORT_RETURN",
+                    "http_status": http_status,
+                    "elapsed_ms": round(latency, 2),
+                    "response_bytes": len(error_body.encode("utf-8")),
+                })
+                self.audit_callback("HTTP_RESPONSE_RECEIVED", {
+                    "event": "HTTP_RESPONSE_RECEIVED",
+                    "http_status": http_status,
+                    "elapsed_ms": round(latency, 2),
+                })
             return DeepSeekResponse(
                 status=RequestOutcomeStatus.HTTP_ERROR,
                 is_success=False,
@@ -296,6 +394,13 @@ class DeepSeekClient:
                 self.budget_controller.record_network_failure(req_id)
 
             is_timeout = isinstance(err, (socket.timeout, TimeoutError)) or "timed out" in str(err).lower()
+            if self.audit_callback:
+                self.audit_callback("LOCAL_TRANSPORT_RETURN", {
+                    "event": "LOCAL_TRANSPORT_RETURN",
+                    "http_status": 0,
+                    "elapsed_ms": round(latency, 2),
+                    "response_bytes": 0,
+                })
             return DeepSeekResponse(
                 status=RequestOutcomeStatus.TIMEOUT_ERROR if is_timeout else RequestOutcomeStatus.NETWORK_ERROR,
                 is_success=False,
@@ -313,6 +418,13 @@ class DeepSeekClient:
             if not skip_budget_reservation and self.budget_controller is not None:
                 self.budget_controller.record_network_failure(req_id)
 
+            if self.audit_callback:
+                self.audit_callback("LOCAL_TRANSPORT_RETURN", {
+                    "event": "LOCAL_TRANSPORT_RETURN",
+                    "http_status": 0,
+                    "elapsed_ms": round(latency, 2),
+                    "response_bytes": 0,
+                })
             return DeepSeekResponse(
                 status=RequestOutcomeStatus.NETWORK_ERROR,
                 is_success=False,
@@ -322,6 +434,18 @@ class DeepSeekClient:
             )
 
         latency = (time.monotonic() - start_time) * 1000.0
+        if self.audit_callback:
+            self.audit_callback("LOCAL_TRANSPORT_RETURN", {
+                "event": "LOCAL_TRANSPORT_RETURN",
+                "http_status": http_status or 0,
+                "elapsed_ms": round(latency, 2),
+                "response_bytes": len(raw_bytes),
+            })
+            self.audit_callback("HTTP_RESPONSE_RECEIVED", {
+                "event": "HTTP_RESPONSE_RECEIVED",
+                "http_status": http_status or 0,
+                "elapsed_ms": round(latency, 2),
+            })
 
         # ---------------------------------------------------------------------
         # 6. Cancellation Check 3: After Network Transmission (Ambiguous Outcome)
@@ -373,6 +497,15 @@ class DeepSeekClient:
             status = RequestOutcomeStatus.HTTP_ERROR
         else:
             status = RequestOutcomeStatus.SUCCESS
+
+        if self.audit_callback:
+            tc_count = len(parsed.tool_calls) if (parsed and parsed.tool_calls) else 0
+            self.audit_callback("PARSER_CLASSIFICATION", {
+                "event": "PARSER_CLASSIFICATION",
+                "classification": status.value,
+                "finish_reason": str(parsed.finish_reason or "none"),
+                "tool_calls_count": tc_count,
+            })
 
         # ---------------------------------------------------------------------
         # 9. Budget Reconciliation

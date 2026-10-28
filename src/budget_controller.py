@@ -50,7 +50,12 @@ class ReservationRecord:
 
 
 class BudgetController:
-    """Deterministic, thread-safe budget controller for official DeepSeek API billing."""
+    """Deterministic, thread-safe budget controller and application-level reservation guard.
+
+    NOTE: The internal ceiling ($0.80) and pre-call token reservations are client-side
+    application reservation guards designed to prevent runaway dispatches. They do NOT
+    constitute provider-enforced billing caps or absolute provider billing guarantees.
+    """
 
     # Official DeepSeek Rates (USD per 1,000,000 tokens)
     # Source: https://api-docs.deepseek.com/quick_start/pricing (Verified October 2026)

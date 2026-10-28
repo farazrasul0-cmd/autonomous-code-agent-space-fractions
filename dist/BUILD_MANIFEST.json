@@ -1,54 +1,16 @@
 {
-  "build_timestamp": "2026-10-27T01:49:00+08:00",
-  "platform": "Windows 11 (AMD64)",
-  "python_version": "3.12.10",
-  "pyinstaller_version": "6.22.3",
-  "build_environment": "packaging_poc/venv",
-  "executables": {
-    "onefile": {
-      "filename": "CodeAgent_Offline.exe",
-      "path": "dist/onefile/CodeAgent_Offline.exe",
-      "size_bytes": 12324902,
-      "sha256": "a22195c7c5e16e6aebdb8e5eb1c57b5d322dcb2bbdb27eac2e36ee3fd9469915",
-      "status": "Verified Stable"
-    },
-    "onedir": {
-      "filename": "CodeAgent_Offline.exe",
-      "path": "dist/onedir/CodeAgent_Offline_onedir/CodeAgent_Offline.exe",
-      "size_bytes": 2142128,
-      "sha256": "e3042a9dfa75cdd6c05c38d5bf0cbb4b04021464a2b9e4d2ac5d8157fc3cfc33",
-      "status": "Verified Fallback"
-    }
+  "application": "DeepSeek Code Agent",
+  "platform": "Windows x64",
+  "packager": "PyInstaller 6.22.3",
+  "executable": {
+    "path": "dist/CodeAgent.exe",
+    "size_bytes": 13314848,
+    "sha256": "63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024",
+    "self_contained": true
   },
-  "bundled_resources": [
-    "Architecture_Documentation.md",
-    "Architecture_View.md",
-    "space_fractions/index.html",
-    "space_fractions/style.css",
-    "space_fractions/fraction_engine.js",
-    "space_fractions/game.js",
-    "space_fractions/fraction_math.py",
-    "space_fractions/game_engine.py",
-    "space_fractions/question_bank.py",
-    "space_fractions/ui_screens.py",
-    "space_fractions/main.py",
-    "space_fractions/README.md",
-    "space_fractions/TRACEABILITY.md",
-    "specs/architecture.md",
-    "specs/openapi.yaml",
-    "specs/internal.proto",
-    "specs/k8s/spacefractions-deployment.yaml",
-    "specs/sql/game_ddl.sql",
-    "specs/traceability_matrix.csv"
-  ],
-  "secret_exclusion": {
+  "security": {
     "dotenv_included": false,
-    "api_keys_embedded": false,
-    "test_credentials_embedded": false
-  },
-  "offline_boundaries": {
-    "deepseek_api_calls_in_build": 0,
-    "cumulative_spend": 0.027616,
-    "hard_ceiling": 0.8
+    "credentials_included": false,
+    "live_api_calls_during_build": 0
   }
 }

@@ -357,7 +357,11 @@ class SynthesisDriver:
         # 2. Path security check on target_artifact relative to workspace_root
         try:
             target_artifact_norm = os.path.normpath(target_artifact)
-            if os.path.isabs(target_artifact_norm) or target_artifact_norm.startswith(".."):
+            if (
+                os.path.isabs(target_artifact_norm)
+                or target_artifact.startswith(("/", "\\"))
+                or target_artifact_norm.startswith("..")
+            ):
                 raise PathSecurityError(f"Target artifact path '{target_artifact}' escapes workspace root.")
         except Exception as err:
             with self.commit_lock:

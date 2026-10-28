@@ -1,0 +1,52 @@
+{
+  "evidence_format": "sanitized-submission-record-v1",
+  "live_run": {
+    "run_id": "28c3e6b6b76f45d6815f88c10f7399b1",
+    "mode": "LIVE_DEEPSEEK_AGENT",
+    "model": "deepseek-v4-pro",
+    "official_api_called": true,
+    "verified_cost_usd": 0.21343854399999995,
+    "static_validation_passed": true,
+    "output_promoted": true,
+    "architecture_view_items": 11,
+    "plantuml_diagrams": 13,
+    "recorded_conflicts": [
+      "CONFLICT-DELIVERABLE-PLATFORM-001"
+    ],
+    "generated_files": [
+      "README.md",
+      "requirements.txt",
+      "space_fractions/fraction_math.py",
+      "space_fractions/game_engine.py",
+      "space_fractions/main.py",
+      "space_fractions/question_bank.py",
+      "space_fractions/ui_screens.py",
+      "tests/test_fraction_game.py"
+    ],
+    "generated_code_executed_inside_live_agent": false
+  },
+  "independent_post_run_verification": {
+    "generated_tests_passed": 37,
+    "generated_tests_failed": 0,
+    "randomized_questions_checked": 1000,
+    "randomized_question_failures": 0,
+    "required_imports_passed": true,
+    "generated_desktop_launch_passed": true
+  },
+  "release_verification": {
+    "repository_tests_passed": 227,
+    "repository_tests_deselected": 3,
+    "packaged_smoke_exit_code": 0,
+    "executable_path": "dist/CodeAgent.exe",
+    "executable_size_bytes": 13314848,
+    "executable_sha256": "63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024",
+    "credentials_included": false
+  },
+  "redaction": {
+    "api_keys_included": false,
+    "authorization_headers_included": false,
+    "raw_request_payloads_included": false,
+    "full_execution_log_included": false
+  }
+}
+

@@ -573,8 +573,8 @@ def test_14_gui_remains_offline_only_regression():
         assert str(app.radio_live.cget("state")) == "disabled"
 
         # 3. Verified spend baseline preserved
-        assert app.budget_controller.cumulative_spend == 0.000186
-        assert app.BASE_VERIFIED_SPEND == 0.000186
+        assert app.budget_controller.cumulative_spend == 0.0
+        assert app.BASE_VERIFIED_SPEND is None
 
         # 4. Starting the worker must run offline pipeline only
         assert hasattr(app, "_run_offline_pipeline_worker")

@@ -50,7 +50,9 @@ class Fraction:
             return cls(int(p[0].strip()), int(p[1].strip()))
         return cls(int(s), 1)
 
-    def __str__(self) -> str: return str(self.n) if self.d == 1 else f"{self.n}/{self.d}"
+    def __str__(self) -> str:
+        reduced = self.simplify()
+        return str(reduced.n) if reduced.d == 1 else f"{reduced.n}/{reduced.d}"
     def __repr__(self) -> str: return f"Fraction({self.n}, {self.d})"
     def __eq__(self, o: object) -> bool: return self.equals(o) if isinstance(o, Fraction) else False
 

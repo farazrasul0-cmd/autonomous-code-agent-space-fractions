@@ -14,8 +14,10 @@ venv/
 packaging_poc/
 build/
 .pytest_cache/
+.code_agent_diagnostics/
 dist/onedir/
 dist/code_agent/
+dist/code_agent_*/
 
 # Local Test & Run Artifacts
 scratch/
@@ -29,7 +31,7 @@ live_submission_run*/
 
 # Historical & Local Evidence
 *interaction_result.txt
-generated_space_fractions/
+generated_space_fractions*/
 canary_runner.py
 run_*.py
 fraction_math_single_turn_run/

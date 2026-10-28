@@ -41,6 +41,8 @@ class ProjectValidator:
 
     REQUIRED_FRACTION_METHODS: Set[str] = {
         "__init__",
+        "__eq__",
+        "__str__",
         "simplify",
         "add",
         "subtract",
@@ -56,9 +58,9 @@ class ProjectValidator:
     }
 
     REQUIRED_GAME_STATES: Set[str] = {
-        "TITLE",
         "PLAYING",
         "PAUSED",
+        "GAME_OVER",
         "GAMEOVER",
     }
 
@@ -129,6 +131,73 @@ class ProjectValidator:
             if missing:
                 errors.append(f"Class 'Fraction' is missing required methods: {sorted(missing)}")
 
+            fraction_class = next(
+                (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Fraction"),
+                None,
+            )
+            init_method = next(
+                (node for node in (fraction_class.body if fraction_class else [])
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__init__"),
+                None,
+            )
+            if init_method is not None:
+                normalization_calls = {
+                    node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+                    for node in ast.walk(init_method)
+                    if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
+                }
+                if normalization_calls & {"gcd", "simplify", "normalize", "_normalize", "reduce", "_reduce"}:
+                    errors.append(
+                        "Fraction.__init__ must preserve the supplied numerator and denominator; "
+                        "reduction belongs in simplify(), which returns a new Fraction."
+                    )
+
+            method_nodes = {
+                node.name: node
+                for node in (fraction_class.body if fraction_class else [])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for method_name in ("add", "subtract"):
+                method_node = method_nodes.get(method_name)
+                has_simplify_call = method_node is not None and any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "simplify"
+                    for node in ast.walk(method_node)
+                )
+                if not has_simplify_call:
+                    errors.append(
+                        f"Fraction.{method_name}() must return a simplified Fraction by calling simplify()."
+                    )
+
+            eq_method = method_nodes.get("__eq__")
+            has_equals_call = eq_method is not None and any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "equals"
+                for node in ast.walk(eq_method)
+            )
+            if not has_equals_call:
+                errors.append("Fraction.__eq__() must delegate to equals() for value-based equality.")
+
+            str_method = method_nodes.get("__str__")
+            has_whole_number_branch = str_method is not None and any(
+                isinstance(node, ast.Compare)
+                and any(isinstance(comp, ast.Constant) and comp.value == 1 for comp in node.comparators)
+                for node in ast.walk(str_method)
+            )
+            str_calls_simplify = str_method is not None and any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "simplify"
+                for node in ast.walk(str_method)
+            )
+            if not has_whole_number_branch or not str_calls_simplify:
+                errors.append(
+                    "Fraction.__str__() must simplify a copy first and display whole-number values without a denominator "
+                    "(for example, Fraction(6, 3) -> '2')."
+                )
+
         # 2. MathQuestionGenerator class
         if "MathQuestionGenerator" not in classes:
             errors.append("Class 'MathQuestionGenerator' is not defined in fraction_math module.")
@@ -161,9 +230,13 @@ class ProjectValidator:
             errors.append("Enum 'GameState' is not defined in game_engine module.")
         else:
             members = set(cls.extract_enum_members(tree, "GameState"))
-            missing_states = cls.REQUIRED_GAME_STATES - members
-            if missing_states:
-                errors.append(f"Enum 'GameState' is missing required states: {sorted(missing_states)}")
+            core_missing = {"PLAYING", "PAUSED"} - members
+            has_game_over = ("GAMEOVER" in members) or ("GAME_OVER" in members)
+            if core_missing or not has_game_over:
+                missing = list(sorted(core_missing))
+                if not has_game_over:
+                    missing.append("GAME_OVER or GAMEOVER")
+                errors.append(f"Enum 'GameState' is missing required states from StateDiagram: {missing}")
 
         return (len(errors) == 0), errors
 
@@ -209,6 +282,31 @@ class ProjectValidator:
 
         if not test_funcs:
             errors.append("No test functions (starting with 'test_') were found in test module.")
+
+        return (len(errors) == 0), errors
+
+    @classmethod
+    def validate_package_imports(cls, tree: ast.AST, rel_path: str) -> Tuple[bool, List[str]]:
+        """Reject sibling imports that fail when ``space_fractions`` is imported as a package."""
+        if not rel_path.startswith("space_fractions/"):
+            return True, []
+
+        sibling_modules = {"fraction_math", "game_engine", "question_bank", "ui_screens", "main"}
+        errors: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module in sibling_modules:
+                    errors.append(
+                        f"Invalid package import in '{rel_path}': 'from {node.module} import ...' "
+                        "must be relative or start with 'space_fractions.'."
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in sibling_modules:
+                        errors.append(
+                            f"Invalid package import in '{rel_path}': 'import {alias.name}' "
+                            "must start with 'space_fractions.'."
+                        )
 
         return (len(errors) == 0), errors
 
@@ -266,7 +364,10 @@ class ProjectValidator:
 
     @classmethod
     def validate_project(
-        cls, project_dir: str, require_full_game: bool = True
+        cls,
+        project_dir: str,
+        require_full_game: bool = True,
+        require_manifest: bool = True,
     ) -> ValidationResult:
         """Executes full static acceptance validation on the designated project directory.
         
@@ -275,7 +376,8 @@ class ProjectValidator:
         - Verifies AST syntax on all Python files.
         - Verifies class and method interface contracts.
         - Verifies test suite presence and test function declarations.
-        - Verifies manifest existence, consistency, and path containment.
+        - Verifies that all deliverables are non-empty (>0 bytes).
+        - Verifies manifest existence, consistency, and path containment (if require_manifest=True).
         """
         errors: List[str] = []
         warnings: List[str] = []
@@ -315,12 +417,16 @@ class ProjectValidator:
         details["total_files_scanned"] = len(all_files)
         details["python_files_scanned"] = len(all_py_files)
 
-        # 2. Static AST syntax check on all Python files
+        # 2. Static AST syntax check on all Python files and verify non-empty
         ast_trees: Dict[str, ast.AST] = {}
         syntax_ok = True
 
         for rel_p, full_p in all_py_files.items():
             try:
+                if os.path.getsize(full_p) == 0:
+                    errors.append(f"Generated python file is empty (0 bytes): '{rel_p}'")
+                    syntax_ok = False
+                    continue
                 with open(full_p, "r", encoding="utf-8") as f:
                     src = f.read()
                 is_valid, err_msg, tree = cls.validate_syntax_ast(src, filename=rel_p)
@@ -334,7 +440,7 @@ class ProjectValidator:
                 syntax_ok = False
                 errors.append(f"Failed to read '{rel_p}': {read_err}")
 
-        # 3. Required file presence check
+        # 3. Required file presence and non-emptiness check
         def find_file(candidates: List[str]) -> Optional[str]:
             for c in candidates:
                 norm_c = c.replace("\\", "/")
@@ -376,12 +482,31 @@ class ProjectValidator:
             if not req_rel:
                 errors.append("Required packaging file missing: 'requirements.txt'")
             if not readme_rel:
-                warnings.append("Documentation file missing: 'README.md'")
-            if not manifest_rel:
+                errors.append("Required documentation missing: 'README.md'")
+            if require_manifest and not manifest_rel:
                 errors.append("Required manifest missing: 'space_fractions_manifest.json' or 'offline_validation_manifest.json'")
+
+            # Check that required non-python deliverables are non-empty
+            for candidate_rel, desc in [
+                (req_rel, "requirements.txt"),
+                (readme_rel, "README.md"),
+            ]:
+                if candidate_rel:
+                    try:
+                        sz = os.path.getsize(os.path.join(real_project_dir, candidate_rel))
+                        if sz == 0:
+                            errors.append(f"Required deliverable '{desc}' is empty (0 bytes).")
+                    except OSError as err:
+                        errors.append(f"Cannot access file '{desc}': {err}")
 
         # 4. Interface checks on AST trees
         interfaces_ok = True
+
+        for rel_p, tree in ast_trees.items():
+            ok, errs = cls.validate_package_imports(tree, rel_p)
+            if not ok:
+                interfaces_ok = False
+                errors.extend(errs)
 
         if math_rel and math_rel in ast_trees:
             ok, errs = cls.validate_fraction_math_interface(ast_trees[math_rel])
@@ -438,11 +563,11 @@ class ProjectValidator:
                 errors.extend(errs)
             else:
                 verified_files.append(manifest_rel)
-        elif require_full_game:
+        elif require_full_game and require_manifest:
             manifest_ok = False
 
         # Overall success
-        success = (len(errors) == 0) and syntax_ok and interfaces_ok
+        success = (len(errors) == 0) and syntax_ok and interfaces_ok and (tests_ok if require_full_game else True)
 
         return ValidationResult(
             success=success,

@@ -166,7 +166,7 @@ class WorkerRunConfig:
     allow_live_dispatch: bool
     api_key: str = ""
     live_timeout: float = 60.0
-    max_turns: int = 12
+    max_turns: int = 20
     workflow_mode: str = "offline_pipeline"
     live_max_output_tokens: int = 2500
     startup_receipt_path: Optional[str] = None
@@ -239,6 +239,11 @@ class OfflineMockAgentClient:
         mock_test_math = 'import pytest\nfrom space_fractions.fraction_math import Fraction\n\ndef test_fraction_math_basic():\n    assert Fraction(1, 2).equals(Fraction(2, 4))\n    assert Fraction(1, 3).add(Fraction(1, 6)) == Fraction(1, 2)\n    assert Fraction(3, 4).subtract(Fraction(1, 2)) == Fraction(1, 4)\n    assert Fraction.from_string("3/4") == Fraction(3, 4)\n'
         mock_test_engine = 'import pytest\nfrom space_fractions.game_engine import GameEngine, GameState\n\ndef test_game_engine_basic():\n    e = GameEngine(level=1, total_questions=5, seed=42)\n    assert e.state == GameState.TITLE\n    e.play()\n    assert e.state == GameState.PLAYING\n    assert e.current_question is not None\n    res = e.submit_answer(e.current_question.correct_index)\n    assert res.is_correct is True\n    assert res.current_score >= 100\n'
         mock_test_game = 'import pytest\nfrom space_fractions.fraction_math import Fraction\nfrom space_fractions.game_engine import GameEngine, GameState\nfrom space_fractions.question_bank import QuestionBank\n\ndef test_space_fractions_integration():\n    f = Fraction(3, 4)\n    assert f.n == 3 and f.d == 4\n    engine = GameEngine()\n    assert engine.state == GameState.TITLE\n    engine.play()\n    assert engine.state == GameState.PLAYING\n    bank = QuestionBank()\n    assert bank.total_curated_questions() >= 20\n    q = bank.get_question(level=1, index=1)\n    assert len(q.options) == 4\n'
+
+        mock_fraction_math = mock_fraction_math.replace(
+            '    def __str__(self): return str(self.n) if self.d == 1 else f"{self.n}/{self.d}"\n',
+            '    def __str__(self):\n        reduced = self.simplify(); return str(reduced.n) if reduced.d == 1 else f"{reduced.n}/{reduced.d}"\n',
+        )
 
         # Detect stage from prompt
         mock_calculator = '"""Command-line calculator implementation."""\nimport sys\n\n\ndef add(a: float, b: float) -> float:\n    return a + b\n\n\ndef subtract(a: float, b: float) -> float:\n    return a - b\n\n\ndef multiply(a: float, b: float) -> float:\n    return a * b\n\n\ndef divide(a: float, b: float) -> float:\n    if b == 0:\n        raise ValueError("Division by zero is undefined.")\n    return a / b\n\n\ndef calculate(operation: str, a: float, b: float) -> float:\n    ops = {\n        "add": add, "+": add,\n        "subtract": subtract, "-": subtract, "sub": subtract,\n        "multiply": multiply, "*": multiply, "mul": multiply,\n        "divide": divide, "/": divide, "div": divide,\n    }\n    op_clean = operation.strip().lower()\n    if op_clean not in ops:\n        raise ValueError(f"Unsupported operation: {operation}")\n    return ops[op_clean](a, b)\n\n\ndef main() -> None:\n    if len(sys.argv) != 4:\n        print("Usage: python calculator.py <operation> <operand1> <operand2>")\n        sys.exit(1)\n    op = sys.argv[1]\n    try:\n        a, b = float(sys.argv[2]), float(sys.argv[3])\n        result = calculate(op, a, b)\n        print(f"Result: {result}")\n    except ValueError as err:\n        print(f"Error: {err}")\n        sys.exit(1)\n\n\nif __name__ == "__main__":\n    main()\n'
@@ -392,7 +397,7 @@ class AgentGUIApp:
         default_output_dir: Optional[str] = None,
         launch_game: bool = False,
         default_task: Optional[str] = None,
-        max_turns: int = 12,
+        max_turns: int = 20,
         live_timeout: float = 60.0,
         resume_staging: Optional[str] = None,
     ) -> None:
@@ -1010,11 +1015,11 @@ class AgentGUIApp:
         target_relative_files = [
             "Architecture_Documentation.md",
             "Architecture_View.md",
-            os.path.join("space_fractions", "index.html"),
-            os.path.join("space_fractions", "style.css"),
-            os.path.join("space_fractions", "fraction_engine.js"),
-            os.path.join("space_fractions", "game.js"),
             os.path.join("space_fractions", "fraction_math.py"),
+            os.path.join("space_fractions", "game_engine.py"),
+            os.path.join("space_fractions", "question_bank.py"),
+            os.path.join("space_fractions", "ui_screens.py"),
+            os.path.join("space_fractions", "main.py"),
             os.path.join("space_fractions", "README.md"),
             os.path.join("space_fractions", "TRACEABILITY.md"),
             os.path.join("specs", "openapi.yaml"),
@@ -1550,7 +1555,7 @@ class AgentGUIApp:
                 effective_api_key = ""
 
             effective_live_timeout = getattr(self, "live_timeout", 60.0)
-            effective_max_turns = getattr(self, "max_turns", 12)
+            effective_max_turns = getattr(self, "max_turns", AgentLoop.MAX_TURNS_DEFAULT)
             effective_workflow_mode = getattr(self, "workflow_mode", "offline_pipeline")
             effective_max_output_tokens = getattr(self, "live_max_output_tokens", 2500)
             startup_receipt_path = getattr(self, "startup_receipt_path", None)
@@ -1867,7 +1872,11 @@ class AgentGUIApp:
                         cancel_event=self.cancel_requested,
                     )
                     loop_budget_controller = self.budget_controller
-                    loop_max_turns = effective_max_turns
+                    # The assignment requires eight project deliverables.  Preserve
+                    # bounded retry capacity for provider truncation/tool-validation
+                    # failures while the BudgetController continues to enforce the
+                    # stricter sub-$1 ($0.80 local) financial ceiling.
+                    loop_max_turns = max(effective_max_turns, AgentLoop.MAX_TURNS_DEFAULT)
                 else:
                     self._queue_msg(
                         "log",
@@ -1966,7 +1975,8 @@ class AgentGUIApp:
                             f"REQUIRED PROJECT DELIVERABLES (use the write_file tool):\n"
                             f"1. space_fractions/fraction_math.py:\n"
                             f"   - Class Fraction(numerator, denominator=1) with methods: __init__, add, subtract, simplify, compare, equals, to_float, __str__, __repr__.\n"
-                            f"   - Class MathQuestionGenerator with method: generate() returning question prompt, options list, correct index, and explanation.\n"
+                            f"   - Class MathQuestionGenerator with method: generate() returning question prompt, options list of display strings (never Fraction objects), correct index, and explanation.\n"
+                            f"   - Random question and distractor generation must guard denominator arithmetic so it can never construct a Fraction with denominator zero; tests must exercise generate() at least 100 times and assert every option is a string.\n"
                             f"2. space_fractions/game_engine.py:\n"
                             f"   - Enum GameState with values: PLAYING, PAUSED, GAME_OVER.\n"
                             f"   - Class GameEngine with methods: play(), submit_answer(answer), pause(), resume(), is_game_over(), and viewScore() or view_score().\n"
@@ -2023,9 +2033,14 @@ class AgentGUIApp:
                         else:
                             accepted_tool_calls += 1
                         outcome = "rejected" if is_err else "accepted"
+                        result_detail = ""
+                        if is_err:
+                            rejection_reason = " ".join((t_entry.tool_result or "Unknown rejection").split())[:500]
+                            result_detail = f" reason={json.dumps(rejection_reason, ensure_ascii=False)}"
                         _append_worker_log(
-                            f"TOOL_RESULT turn={t_entry.turn_index} tool={t_entry.tool_name} outcome={outcome}",
-                            "INFO",
+                            f"TOOL_RESULT turn={t_entry.turn_index} tool={t_entry.tool_name} "
+                            f"outcome={outcome}{result_detail}",
+                            "WARNING" if is_err else "INFO",
                         )
 
                 _record_audit_milestone("TOOL_DISPATCH_SUMMARY", {
@@ -2831,8 +2846,8 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=12,
-        help="Maximum model turns for AgentLoop (default: 12).",
+        default=AgentLoop.MAX_TURNS_DEFAULT,
+        help="Maximum model turns for AgentLoop (default: 24; live canonical generation uses at least 24).",
     )
     parser.add_argument(
         "--timeout",

@@ -4,6 +4,7 @@ Validates multi-turn ReAct orchestration, schema enforcement, adversarial tool r
 circuit breakers, 12-turn limits, and ensures ZERO subprocesses and ZERO network calls occur.
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ import pytest
 from src.agent_loop import (
     AgentLoop,
     CommandExecutorProtocol,
+    DeepSeekAgentAdapter,
     LLMClientProtocol,
     LoopTerminationStatus,
     ModelTurnResponse,
@@ -336,6 +338,114 @@ def test_repeated_failure_circuit_breaker(workspace_env, budget_controller):
     assert result.total_turns == 3
 
 
+def test_write_file_content_is_compacted_before_followup_turn(workspace_env, budget_controller):
+    """Large completed writes must not be replayed into the next request."""
+    large_source = "# generated source\n" + ("x" * 12_000)
+    llm = ScriptedLLMClient([
+        ModelTurnResponse(
+            content="Writing source.",
+            tool_calls=[ToolCall(
+                tool_id="write_large",
+                name="write_file",
+                arguments={"path": "large_module.py", "content": large_source},
+            )],
+            raw_usage={"prompt_tokens": 100, "completion_tokens": 100},
+        ),
+        ModelTurnResponse(
+            content="Done.",
+            tool_calls=[],
+            raw_usage={"prompt_tokens": 100, "completion_tokens": 10},
+        ),
+    ])
+
+    result = AgentLoop(
+        workspace_env, llm, budget_controller=budget_controller, max_turns=2
+    ).run("Write one large module, then complete.")
+
+    assert result.status == LoopTerminationStatus.COMPLETED
+    assert len(llm.history) == 2
+    followup_context = json.dumps(llm.history[1])
+    assert large_source not in followup_context
+    assert "[content omitted after local write]" in followup_context
+
+
+def test_long_react_history_is_windowed_before_eighth_dispatch(workspace_env, budget_controller):
+    """Eight-file generation must not hit the 8k input guard from envelope growth."""
+    agent = AgentLoop(workspace_env, ScriptedLLMClient([]), budget_controller=budget_controller)
+    initial = [
+        {"role": "system", "content": "system contract " + ("s" * 900)},
+        {"role": "user", "content": "task contract " + ("u" * 1800)},
+    ]
+    messages = list(initial)
+    for turn in range(1, 8):
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "written",
+                "tool_calls": [{
+                    "id": f"call_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({
+                            "path": f"file_{turn}.py",
+                            "content": agent.COMPACTED_CONTENT_MARKER,
+                        }),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": f"call_{turn}",
+                "name": "write_file",
+                "content": "File written and validated. " + ("o" * 350),
+            },
+            {"role": "user", "content": f"DIRECTIVE FOR TURN {turn + 1}: write the next file. " + ("g" * 220)},
+        ])
+
+    before = budget_controller.calculate_request_token_bound(
+        {"messages": messages, "tools": agent.tools_schema}
+    )
+    compacted = agent._compact_message_history_if_needed(messages)
+    after = budget_controller.calculate_request_token_bound(
+        {"messages": compacted, "tools": agent.tools_schema}
+    )
+
+    assert before > agent.CONTEXT_COMPACTION_TRIGGER
+    assert after <= agent.CONTEXT_COMPACTION_TRIGGER
+    assert compacted[:2] == initial
+    assert compacted[-1]["content"].startswith("DIRECTIVE FOR TURN 8")
+    assert any(m.get("tool_call_id") == "call_7" for m in compacted)
+    assert not any(m.get("tool_call_id") == "call_1" for m in compacted)
+
+
+def test_checklist_context_never_replays_compaction_marker(workspace_env, budget_controller):
+    """Disk-driven generation must not teach the model to echo internal placeholders."""
+    live_adapter = object.__new__(DeepSeekAgentAdapter)
+    agent = AgentLoop(
+        workspace_env,
+        live_adapter,
+        budget_controller=budget_controller,
+        deliverables_checklist=["README.md"],
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original task"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [{"function": {"name": "write_file", "arguments": agent.COMPACTED_CONTENT_MARKER}}],
+        },
+        {"role": "tool", "content": "write rejected", "tool_call_id": "c1"},
+        {"role": "user", "content": "DIRECTIVE: retry README.md. PREVIOUS WRITE REJECTION: placeholder."},
+    ]
+
+    compacted = agent._compact_message_history_if_needed(messages)
+
+    assert compacted == [messages[0], messages[1], messages[-1]]
+    assert agent.COMPACTED_CONTENT_MARKER not in json.dumps(compacted)
+
+
 def test_turn_limit_exhaustion(workspace_env, budget_controller):
     """Validates that a continuous loop terminates strictly at the max_turns limit (12)."""
     mock_cmd = MockCommandExecutor()
@@ -355,6 +465,21 @@ def test_turn_limit_exhaustion(workspace_env, budget_controller):
     assert result.status == LoopTerminationStatus.MAX_TURNS_REACHED
     assert result.total_turns == 12
     assert "reached maximum turn limit of 12" in (result.error_message or "")
+
+
+def test_default_turn_budget_covers_eight_deliverables_and_retries(workspace_env, budget_controller):
+    """Canonical generation must retain bounded recovery turns under the cost guard."""
+    agent = AgentLoop(workspace_env, ScriptedLLMClient([]), budget_controller=budget_controller)
+    assert agent.max_turns == 24
+    assert agent.max_turns >= len(AgentLoop.CANONICAL_SPACE_FRACTIONS_DELIVERABLES) + 5
+
+
+def test_fraction_math_hint_requires_safe_randomized_denominators():
+    hint = AgentLoop.get_deliverable_hint("space_fractions/fraction_math.py")
+    assert "denominator zero" in hint
+    assert "at least 100 times" in hint
+    assert "display strings (not Fraction objects)" in hint
+    assert "every option is a string" in hint
 
 
 def test_budget_exhaustion_halts_loop(workspace_env):

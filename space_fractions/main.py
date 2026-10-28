@@ -1,22 +1,12 @@
 from __future__ import annotations
-import os, sys, re
+import re
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
-if _DIR not in sys.path: sys.path.insert(0, _DIR)
-_PARENT = os.path.dirname(_DIR)
-if _PARENT not in sys.path: sys.path.insert(0, _PARENT)
-
-try:
-    from space_fractions.game_engine import GameEngine, GameState, TurnResult
-    from space_fractions.question_bank import Question
-    from space_fractions.ui_screens import FractionVisualizer, HUDFrame
-except ImportError:
-    from game_engine import GameEngine, GameState, TurnResult
-    from question_bank import Question
-    from ui_screens import FractionVisualizer, HUDFrame
+from space_fractions.game_engine import GameEngine, GameState, TurnResult
+from space_fractions.question_bank import Question
+from space_fractions.ui_screens import FractionVisualizer, HUDFrame
 
 class SpaceFractionsApp:
     def __init__(self, root: tk.Tk) -> None:
