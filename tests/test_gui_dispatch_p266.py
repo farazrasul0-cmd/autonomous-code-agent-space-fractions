@@ -25,7 +25,7 @@ from src.agent_gui import AgentGUIApp, WorkerRunConfig
 from src.budget_controller import BudgetController
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def tk_root():
     """Provides an isolated headless Tkinter root for GUI testing."""
     root = tk.Tk()
