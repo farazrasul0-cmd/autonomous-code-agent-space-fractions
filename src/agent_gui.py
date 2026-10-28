@@ -370,6 +370,9 @@ class AgentGUIApp:
     DEFAULT_VIEW_FILE = "Architecture_View.md"
     DEFAULT_OUTPUT_DIR = "generated_space_fractions"
 
+    DEFAULT_OFFLINE_TASK = "Ingest architecture specs, extract 11 views / 13 PlantUML diagrams, and run offline pipeline."
+    DEFAULT_AGENT_TASK = "Synthesize Space Fractions Grade 6 educational game from Kruchten 4+1 architecture specifications."
+
     # Historical spend baseline (unreconciled without centralized repository ledger)
     BASE_VERIFIED_SPEND: Optional[float] = None
     HARD_CEILING = 0.800000
@@ -401,6 +404,7 @@ class AgentGUIApp:
         self.allow_live_dispatch: bool = allow_live_dispatch
         self.workflow_mode: str = workflow_mode
         self.synthesis_runner_factory: Optional[Callable[..., Any]] = synthesis_runner_factory
+        self.default_execution_mode: str = default_execution_mode
         self.default_output_dir: Optional[str] = default_output_dir
         self.launch_game = launch_game
         self.default_task = default_task
@@ -410,6 +414,11 @@ class AgentGUIApp:
         self.resume_staging = resume_staging
         self._game_window: Optional[tk.Toplevel] = None
         self._game_app: Optional[Any] = None
+
+        self._env_file_found: bool = False
+        self._key_source_is_env: bool = False
+        self._loading_env: bool = False
+        self.lbl_subtitle: Optional[ttk.Label] = None
 
         self.root.title("DeepSeek Autonomous Code Agent — Space Fractions [Offline Shell]")
         self.root.geometry("1020x740")
@@ -534,12 +543,12 @@ class AgentGUIApp:
         )
         title_lbl.pack(anchor=tk.W)
 
-        subtitle_lbl = ttk.Label(
+        self.lbl_subtitle = ttk.Label(
             header_frame,
             text="Offline Scaffolding & Verification Shell | Model: deepseek-v4-pro (Simulated Offline Mode)",
             style="Subtitle.TLabel",
         )
-        subtitle_lbl.pack(anchor=tk.W)
+        self.lbl_subtitle.pack(anchor=tk.W)
 
     def _build_config_form(self, parent: ttk.LabelFrame) -> None:
         """Builds API key masking, file selection controls, and output folder assignment."""
@@ -548,13 +557,14 @@ class AgentGUIApp:
         # API Key
         ttk.Label(parent, text="DeepSeek API Key:").grid(row=0, column=0, sticky=tk.W, pady=3)
         self.api_key_var = tk.StringVar()
+        self.api_key_var.trace_add("write", self._on_api_key_user_edited)
         self.api_key_entry = ttk.Entry(parent, textvariable=self.api_key_var, show="*", width=38)
         self.api_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=4, pady=3)
 
         self.btn_load_env = ttk.Button(parent, text="Auto-Load .env", command=self._auto_load_env_secret)
         self.btn_load_env.grid(row=0, column=2, padx=2, pady=3)
 
-        self.key_status_var = tk.StringVar(value="Key Status: Not Loaded")
+        self.key_status_var = tk.StringVar(value="Key Status: No local .env detected")
         self.lbl_key_status = ttk.Label(parent, textvariable=self.key_status_var, font=("Segoe UI", 8), foreground="#718096")
         self.lbl_key_status.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=4)
 
@@ -586,7 +596,7 @@ class AgentGUIApp:
         # Task Description
         ttk.Label(parent, text="Task Goal:").grid(row=5, column=0, sticky=tk.W, pady=3)
         initial_task = getattr(self, "default_task", None) or (
-            "Ingest architecture specs, extract 11 views / 13 PlantUML diagrams, and run offline pipeline."
+            self.DEFAULT_AGENT_TASK if getattr(self, "default_execution_mode", "offline") in ("mock_agent", "live") else self.DEFAULT_OFFLINE_TASK
         )
         self.task_desc_var = tk.StringVar(value=initial_task)
         self.task_entry = ttk.Entry(parent, textvariable=self.task_desc_var, width=38)
@@ -694,8 +704,10 @@ class AgentGUIApp:
         parent.bind("<Configure>", _on_parent_configure)
 
     def _on_execution_mode_changed(self, *args: Any) -> None:
-        """Updates UI status and mode badge when execution mode changes."""
-        mode = self.execution_mode_var.get()
+        """Updates UI status, window title, subtitle, button labels, and mode badge when execution mode changes."""
+        mode = self.execution_mode_var.get() if hasattr(self, "execution_mode_var") else "offline"
+
+        # 1. Update Mode Badge
         if hasattr(self, "lbl_mode_badge"):
             if mode == "mock_agent":
                 self.lbl_mode_badge.configure(text="OFFLINE MOCK AGENT (Multi-Stage AgentLoop)")
@@ -706,6 +718,71 @@ class AgentGUIApp:
                     self.lbl_mode_badge.configure(text="LIVE API MODE (DISABLED)")
             else:
                 self.lbl_mode_badge.configure(text="OFFLINE VALIDATION (Mock Engine)")
+
+        # 2. Update Subtitle
+        if hasattr(self, "lbl_subtitle") and self.lbl_subtitle:
+            if mode == "mock_agent":
+                self.lbl_subtitle.configure(
+                    text="Deterministic Multi-Stage AgentLoop Simulation | Model: deepseek-v4-pro (Offline Mock Double)"
+                )
+            elif mode == "live":
+                if self.allow_live_dispatch:
+                    self.lbl_subtitle.configure(
+                        text="Live Autonomous Generation | Model: deepseek-v4-pro (Official HTTPS API)"
+                    )
+                else:
+                    self.lbl_subtitle.configure(
+                        text="Live API Mode (Disabled — Explicit User Opt-In Required)"
+                    )
+            else:
+                self.lbl_subtitle.configure(
+                    text="Offline Scaffolding & Verification Shell | Model: deepseek-v4-pro (Simulated Offline Mode)"
+                )
+
+        # 3. Update Window Title
+        if hasattr(self, "root") and self.root:
+            if mode == "mock_agent":
+                self.root.title("DeepSeek Autonomous Code Agent — Space Fractions [Offline Mock Agent]")
+            elif mode == "live":
+                if self.allow_live_dispatch:
+                    self.root.title("DeepSeek Autonomous Code Agent — Space Fractions [Live Agent]")
+                else:
+                    self.root.title("DeepSeek Autonomous Code Agent — Space Fractions [Live API Disabled]")
+            else:
+                self.root.title("DeepSeek Autonomous Code Agent — Space Fractions [Offline Shell]")
+
+        # 4. Update Start Button Label and Status
+        if not getattr(self, "is_running", False):
+            if hasattr(self, "btn_start"):
+                if mode == "mock_agent":
+                    self.btn_start.configure(text="▶  Start Mock Agent Synthesis")
+                elif mode == "live":
+                    if self.allow_live_dispatch:
+                        self.btn_start.configure(text="▶  Start Live Agent Generation")
+                    else:
+                        self.btn_start.configure(text="▶  Live Dispatch Unauthorized")
+                else:
+                    self.btn_start.configure(text="▶  Start Offline Validation")
+
+            if hasattr(self, "status_var"):
+                if mode == "mock_agent":
+                    self.status_var.set("Ready. Click 'Start Mock Agent Synthesis' to execute.")
+                elif mode == "live":
+                    if self.allow_live_dispatch:
+                        self.status_var.set("Ready. Click 'Start Live Agent Generation' to execute authorized live run.")
+                    else:
+                        self.status_var.set("Live dispatch disabled. Check 'Authorize Live DeepSeek API Dispatch' first.")
+                else:
+                    self.status_var.set("Ready. Click 'Start Offline Validation' to execute.")
+
+        # 5. Adapt Default Task Goal if user hasn't typed a custom task goal
+        if hasattr(self, "task_desc_var"):
+            current_task = self.task_desc_var.get().strip()
+            if not getattr(self, "default_task", None):
+                if mode == "offline" and current_task == self.DEFAULT_AGENT_TASK:
+                    self.task_desc_var.set(self.DEFAULT_OFFLINE_TASK)
+                elif mode in ("mock_agent", "live") and current_task == self.DEFAULT_OFFLINE_TASK:
+                    self.task_desc_var.set(self.DEFAULT_AGENT_TASK)
 
     def _on_toggle_live_auth(self) -> None:
         """Toggles live dispatch authorization and updates live radio button state."""
@@ -1025,25 +1102,78 @@ class AgentGUIApp:
             except Exception:
                 pass
 
+    def _find_env_file(self) -> Optional[str]:
+        """Discovers local .env file in standard search locations without logging contents."""
+        candidates = [
+            os.path.join(os.getcwd(), ".env"),
+            os.path.abspath(".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(sys.executable)), ".env"),
+        ]
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(os.path.join(getattr(sys, "_MEIPASS"), ".env"))
+
+        seen = set()
+        for cand in candidates:
+            norm_cand = os.path.realpath(os.path.abspath(cand))
+            if norm_cand not in seen:
+                seen.add(norm_cand)
+                if os.path.isfile(norm_cand):
+                    return norm_cand
+        return None
+
+    def _update_key_status(self) -> None:
+        """Updates key status display based on current api_key_var and .env detection."""
+        val = self.api_key_var.get().strip() if hasattr(self, "api_key_var") else ""
+        if val:
+            if getattr(self, "_key_source_is_env", False):
+                self.key_status_var.set("Key Status: Masked Key Loaded from .env (Local Only)")
+            else:
+                self.key_status_var.set("Key Status: Key Configured via GUI Entry (Masked)")
+        else:
+            if getattr(self, "_env_file_found", False):
+                self.key_status_var.set("Key Status: .env exists but key is empty")
+            else:
+                self.key_status_var.set("Key Status: No local .env detected")
+
+    def _on_api_key_user_edited(self, *args: Any) -> None:
+        """Invoked when user modifies api_key_var in the GUI."""
+        if not getattr(self, "_loading_env", False):
+            self._key_source_is_env = False
+        self._update_key_status()
+
     def _auto_load_env_secret(self) -> None:
-        """Loads DEEPSEEK_API_KEY from local .env if present, strictly without logging."""
-        env_path = os.path.abspath(".env")
-        if not os.path.isfile(env_path):
-            self.key_status_var.set("Key Status: No local .env detected")
+        """Loads DEEPSEEK_API_KEY from discovered .env if present, strictly without logging."""
+        env_path = self._find_env_file()
+        if not env_path:
+            self._env_file_found = False
+            self._key_source_is_env = False
+            self._update_key_status()
             return
 
+        self._env_file_found = True
         try:
+            found_key = ""
             with open(env_path, "r", encoding="utf-8") as f:
                 for line in f:
                     stripped = line.strip()
                     if stripped.startswith("DEEPSEEK_API_KEY="):
                         val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
                         if val:
-                            self.api_key_var.set(val)
-                            self.key_status_var.set("Key Status: Masked Key Loaded from .env (Local Only)")
-                            return
-            self.key_status_var.set("Key Status: .env exists but key is empty")
+                            found_key = val
+                            break
+            if found_key:
+                self._loading_env = True
+                try:
+                    self._key_source_is_env = True
+                    self.api_key_var.set(found_key)
+                finally:
+                    self._loading_env = False
+            else:
+                self._key_source_is_env = False
+            self._update_key_status()
         except Exception:
+            self._key_source_is_env = False
             self.key_status_var.set("Key Status: Unable to read .env")
 
     def _browse_doc_file(self) -> None:
