@@ -38,8 +38,8 @@
     "repository_tests_deselected": 3,
     "packaged_smoke_exit_code": 0,
     "executable_path": "dist/CodeAgent.exe",
-    "executable_size_bytes": 13314848,
-    "executable_sha256": "63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024",
+    "executable_size_bytes": 12533957,
+    "executable_sha256": "f07bc5ea25abe010246b5aea6212acb5372da1bfa56cea08373bee61f0512f87",
     "credentials_included": false
   },
   "redaction": {

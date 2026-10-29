@@ -4,8 +4,8 @@
   "packager": "PyInstaller 6.22.3",
   "executable": {
     "path": "dist/CodeAgent.exe",
-    "size_bytes": 13314848,
-    "sha256": "63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024",
+    "size_bytes": 12533957,
+    "sha256": "f07bc5ea25abe010246b5aea6212acb5372da1bfa56cea08373bee61f0512f87",
     "self_contained": true
   },
   "security": {

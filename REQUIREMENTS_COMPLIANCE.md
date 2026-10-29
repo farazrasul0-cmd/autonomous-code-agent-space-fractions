@@ -45,7 +45,7 @@ This matrix maps the professor's Task 1 requirements and email clarification to 
 | Randomized question stress check | `1,000/1,000 passed` |
 | Generated desktop launch | Passed |
 | Packaged executable smoke test | Exit code `0` |
-| Release SHA-256 | `63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024` |
+| Release SHA-256 | `f07bc5ea25abe010246b5aea6212acb5372da1bfa56cea08373bee61f0512f87` |
 | Final live run | `28c3e6b6b76f45d6815f88c10f7399b1` |
 | Final live-run cost | `$0.213439` |
 

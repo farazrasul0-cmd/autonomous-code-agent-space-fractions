@@ -5,8 +5,8 @@
 - Application: DeepSeek Code Agent
 - Platform: Windows 10/11 x64
 - Executable: `dist/CodeAgent.exe`
-- Size: `13,314,848` bytes
-- SHA-256: `63d9bc59571de4a1566e8f435506c0caa20e059d6945a943ed27669ea265e024`
+- Size: `12,533,957` bytes
+- SHA-256: `f07bc5ea25abe010246b5aea6212acb5372da1bfa56cea08373bee61f0512f87`
 - PyInstaller: `6.22.3`
 
 The executable size and hash were recomputed after the final build and match `dist/BUILD_MANIFEST.json`.

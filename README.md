@@ -62,6 +62,12 @@ The submission build and its final generated project were independently verified
 
 The stated cost is the verified cost of the final demonstrated generation run. It is not a claim about the combined cost of every historical development or debugging run.
 
+## Demonstration Video
+
+A complete walkthrough demonstrating the Windows desktop agent, architecture input parsing, live authorization controls, generated code artifacts, and interactive gameplay of the Space Fractions desktop client is available on YouTube:
+
+- **YouTube Demonstration:** [https://youtu.be/U1p9AeE_6p8](https://youtu.be/U1p9AeE_6p8)
+
 ## Rebuild
 
 The recipe expects a verified Tcl/Tk 8.6 runtime. Set `CODE_AGENT_TK_RUNTIME_ROOT` if it is not installed at `C:\msys64\mingw64`.
@@ -73,7 +79,7 @@ pyinstaller --noconfirm --clean --distpath dist --workpath build packaging/code_
 Current executable SHA-256:
 
 ```text
-63D9BC59571DE4A1566E8F435506C0CAA20E059D6945A943ED27669EA265E024
+F07BC5EA25ABE010246B5AEA6212ACB5372DA1BFA56CEA08373BEE61F0512F87
 ```
 
 ## Safety boundaries
